@@ -1,0 +1,262 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─── Helper Functions ──────────────────────────────────────────────────────
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isAuthenticated() && request.auth.uid == uid;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    // Reads the caller's own user document to check moderation flags.
+    // A user is considered "active" (not banned or paused).
+    function isActiveUser() {
+      let userDoc = get(/databases/$(database)/documents/users/$(request.auth.uid));
+      return isAuthenticated()
+        && userDoc.data.get('isBanned', false) != true
+        && userDoc.data.get('isPaused', false) != true;
+    }
+
+    // Returns true if the caller's ID proof has NOT been rejected.
+    // Used to prevent rejected users from creating tasks or accepting work.
+    function isNotIdRejected() {
+      let userDoc = get(/databases/$(database)/documents/users/$(request.auth.uid));
+      return userDoc.data.get('idProofStatus', 'Pending') != 'Rejected';
+    }
+
+    // ─── Task Lifecycle Helpers ────────────────────────────────────────────────
+    // These mirror the exact write paths in database_service.dart so each task
+    // transition is scoped to the role that's actually allowed to perform it.
+
+    function isTaskPoster() {
+      return request.auth.uid == resource.data.postedByUid;
+    }
+
+    function isTaskTargetHelper() {
+      return request.auth.uid == resource.data.get('targetHelperUid', null);
+    }
+
+    function isAssignedWorker() {
+      return request.auth.uid == resource.data.get('acceptedByUid', null);
+    }
+
+    function taskKeysChangedOnly(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+
+
+    // ===== ADMINS COLLECTION =====
+    // SECURITY FIX: Only existing admins may write admin documents.
+    // New admins must be granted via Firebase Console or a Cloud Function
+    // using the Admin SDK — never from a client app.
+    match /admins/{adminId} {
+      allow read: if isAuthenticated() && request.auth.uid == adminId;
+      allow write: if false; // LOCKED — use Firebase Console or Admin SDK Cloud Function
+    }
+
+    // ===== ADMIN AUDIT LOGS =====
+    // Admins can read and create. Nobody can update or delete logs.
+    match /adminLogs/{logId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin();
+      allow update, delete: if false;
+    }
+
+    // ===== USERS COLLECTION =====
+    match /users/{userId} {
+      // Any authenticated user can read user documents.
+      allow read: if isAuthenticated();
+
+      // A user can create their own profile only if they're not banned.
+      // Admins can create/update any user doc.
+      allow create: if isOwner(userId) || isAdmin();
+
+      // Owner can update their own profile.
+      // Exception: moderation fields (isBanned, isPaused, canPost) are admin-only.
+      // ID proof fields (idProofUrl, idProofStatus) can be updated by owner ONLY when
+      // submitting for review — i.e. setting status to 'Pending Verification'.
+      // This prevents self-verification while still allowing photo re-uploads.
+      allow update: if isAdmin()
+        || (isOwner(userId)
+            && !request.resource.data.diff(resource.data).affectedKeys()
+                .hasAny(['isBanned', 'isPaused', 'canPost'])
+            && (!request.resource.data.diff(resource.data).affectedKeys()
+                    .hasAny(['idProofStatus'])
+                || request.resource.data['idProofStatus'] == 'Pending Verification'));
+
+      // Only admins can delete a user document.
+      allow delete: if isAdmin();
+
+      // EXCEPTION: Allow wallet/rating updates for the payAndCompleteTask flow —
+      // the poster debits their OWN wallet and credits the WORKER's wallet in one
+      // batch. Wallet top-ups are admin-only (users start with a fixed simulated
+      // balance and cannot mint money into their own account from the client).
+      // In production: replace with Cloud Functions using Admin SDK.
+      allow update: if isActiveUser()
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['walletBalance', 'ratingSum', 'ratingCount', 'tasksDone'])
+        && (
+          // Paying for a task: caller may only decrease their OWN balance.
+          (userId == request.auth.uid
+            && request.resource.data.get('walletBalance', 0) <= resource.data.get('walletBalance', 0))
+          ||
+          // Receiving payment: caller may only increase SOMEONE ELSE's balance.
+          (userId != request.auth.uid
+            && request.resource.data.get('walletBalance', 0) >= resource.data.get('walletBalance', 0))
+        );
+
+      // Notifications: owner reads/updates. Any active (non-banned/paused) user
+      // can create one in someone else's mailbox (needed for apply/offer/pay
+      // flows), but must not be able to impersonate a different sender.
+      match /notifications/{notifId} {
+        allow read, update, delete: if isOwner(userId);
+        allow create: if isActiveUser()
+          && request.resource.data.get('fromUid', null) == request.auth.uid;
+      }
+
+      // Transactions: only owner can read; active auth users can create (payment flow)
+      match /transactions/{txId} {
+        allow read: if isOwner(userId) || isAdmin();
+        allow create: if isAuthenticated();
+        allow update, delete: if false;
+      }
+
+      // Remarks: admin-written email records, user can read their own
+      match /remarks/{remarkId} {
+        allow read: if isOwner(userId) || isAdmin();
+        allow create, update: if isAdmin();
+        allow delete: if false; // Remarks are immutable audit records
+      }
+    }
+
+    // ===== TASKS COLLECTION =====
+    match /tasks/{taskId} {
+      // Any authenticated user can read tasks.
+      allow read: if isAuthenticated();
+
+      // Only active (not banned/paused) users with non-rejected ID can post tasks.
+      allow create: if isActiveUser()
+        && isNotIdRejected()
+        && request.auth.uid == request.resource.data.postedByUid;
+
+      // Active authenticated users can update (apply, bid, assign, markDone, pay) —
+      // but ONLY through one of the specific, role-scoped transitions below.
+      // Rejected users may still update (e.g. mark done on assigned tasks) but NOT create.
+      // postedByUid is immutable after creation no matter which branch below matches.
+      allow update: if isActiveUser()
+        && request.resource.data.postedByUid == resource.data.postedByUid
+        && (
+          // A helper applies to an open task (adds themselves + their own bid only).
+          (taskKeysChangedOnly(['applicants', 'bids'])
+            && resource.data.status == 'open'
+            && request.auth.uid in request.resource.data.applicants
+            && request.resource.data.get('bids', {}).diff(resource.data.get('bids', {}))
+                .affectedKeys().hasOnly([request.auth.uid]))
+
+          // Poster proposes the task directly to a specific helper.
+          || (isTaskPoster()
+              && taskKeysChangedOnly(['status', 'targetHelperUid', 'applicants', 'proposedPrice', 'proposedAt'])
+              && request.resource.data.status == 'pending_worker_acceptance')
+
+          // Poster or the targeted helper accepts a pending proposal — only the
+          // bid entry for the helper being assigned may change.
+          || ((isTaskPoster() || isTaskTargetHelper())
+              && taskKeysChangedOnly(['status', 'acceptedByUid', 'assignedAt', 'bids'])
+              && request.resource.data.status == 'assigned'
+              && request.resource.data.get('bids', {}).diff(resource.data.get('bids', {}))
+                  .affectedKeys().hasOnly([request.resource.data.acceptedByUid]))
+
+          // Poster or the targeted helper declines a pending proposal.
+          || ((isTaskPoster() || isTaskTargetHelper())
+              && taskKeysChangedOnly(['status', 'targetHelperUid', 'proposedPrice', 'proposedAt'])
+              && request.resource.data.status == 'open')
+
+          // Poster or the targeted helper sends a counter-offer.
+          || ((isTaskPoster() || isTaskTargetHelper())
+              && taskKeysChangedOnly(['status', 'proposedPrice', 'proposedAt'])
+              && (request.resource.data.status == 'pending_worker_acceptance'
+                  || request.resource.data.status == 'pending_poster_acceptance'))
+
+          // The assigned worker marks their side of the task as done.
+          || (isAssignedWorker()
+              && taskKeysChangedOnly(['workerCompleted', 'workerCompletedAt']))
+
+          // Poster pays out and closes the task.
+          || (isTaskPoster()
+              && taskKeysChangedOnly(['status', 'completedAt', 'finalPricePaid', 'workerRating'])
+              && request.resource.data.status == 'completed')
+
+          // Anyone may flip a task to 'expired' (client-triggered cleanup), but
+          // only if it's genuinely open and past its own endTime.
+          || (taskKeysChangedOnly(['status'])
+              && resource.data.status == 'open'
+              && resource.data.endTime < request.time
+              && request.resource.data.status == 'expired')
+        );
+
+      // Only the task poster or an admin can delete a task.
+      allow delete: if (isActiveUser() && request.auth.uid == resource.data.postedByUid)
+        || isAdmin();
+
+      // Task activity log
+      match /taskLog/{logId} {
+        allow read: if isAuthenticated();
+        allow create: if isAuthenticated();
+        allow update, delete: if false; // Logs are immutable
+      }
+    }
+
+    // ===== CHATS COLLECTION =====
+    match /chats/{chatId} {
+      allow read: if isAuthenticated()
+        && (resource == null || request.auth.uid in resource.data.participants);
+      allow create: if isActiveUser()
+        && request.auth.uid in request.resource.data.participants;
+      allow update, delete: if isActiveUser()
+        && request.auth.uid in resource.data.participants;
+
+      match /messages/{messageId} {
+        allow read, create: if isAuthenticated()
+          && request.auth.uid in
+            get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
+        allow update, delete: if false;
+      }
+    }
+
+    // ===== WITHDRAWALS COLLECTION =====
+    match /withdrawals/{withdrawalId} {
+      allow read: if isAuthenticated() && (request.auth.uid == resource.data.uid || isAdmin());
+      allow create: if isActiveUser() && request.auth.uid == request.resource.data.uid;
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    // ===== TRANSACTIONS COLLECTION GROUP =====
+    // Needed so admins can stream all transactions across all users.
+    match /{path=**}/transactions/{txId} {
+      allow read: if isAdmin();
+    }
+
+    // ===== METADATA / APP CONFIG =====
+    // Read-only for any authenticated user. Writes only via Firebase Console.
+    match /metadata/{docId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // ===== MAIL COLLECTION (Firebase Trigger Email Extension) =====
+    // Only admins can write emails to the trigger queue.
+    match /mail/{mailId} {
+      allow read, write: if isAdmin();
+    }
+  }
+}
