@@ -5,6 +5,8 @@ import '../utils/app_colors.dart';
 import '../utils/picked_image.dart';
 import '../services/auth_service.dart';
 import '../services/database_service.dart';
+import '../services/payment_mode_service.dart';
+import '../utils/wallet_balance.dart';
 import 'wallet_screen.dart';
 import 'settings_screen.dart';
 
@@ -16,6 +18,22 @@ class ProfileScreen extends StatefulWidget {
 }
 
 class _ProfileScreenState extends State<ProfileScreen> {
+  void _onPaymentMode() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    PaymentModeService.instance.razorpayOn.addListener(_onPaymentMode);
+  }
+
+  @override
+  void dispose() {
+    PaymentModeService.instance.razorpayOn.removeListener(_onPaymentMode);
+    super.dispose();
+  }
+
   // Single DatabaseService instance — avoids creating a new stream on every rebuild
   final DatabaseService _db = DatabaseService();
 
@@ -38,7 +56,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
           final userData = snapshot.data!.data() as Map<String, dynamic>;
 
-          int wallet = (userData['walletBalance'] ?? 0).toInt();
+          int wallet = balanceToShow(userData, razorpayOn: PaymentModeService.instance.razorpayOn.value);
           int tasksDone = userData['tasksDone'] ?? 0;
           double ratingSum = (userData['ratingSum'] ?? 0).toDouble();
           int ratingCount = userData['ratingCount'] ?? 0;

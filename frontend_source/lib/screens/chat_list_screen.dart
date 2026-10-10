@@ -3,8 +3,10 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:provider/provider.dart';
 import '../services/database_service.dart';
+import '../services/hired_contacts.dart';
 import '../utils/app_colors.dart';
 import '../utils/language_provider.dart';
+import '../utils/name_utils.dart';
 import 'chat_screen.dart';
 
 class ChatListScreen extends StatefulWidget {
@@ -65,15 +67,20 @@ class _ChatListScreenState extends State<ChatListScreen> {
                 builder: (context, userSnapshot) {
                   if (!userSnapshot.hasData) return const ListTile(title: Text('Loading...'));
                   final userData = userSnapshot.data!.data() as Map<String, dynamic>? ?? {};
-                  final otherName = userData['fullName'] ?? 'Unknown User';
+                  final String otherName = userData['fullName'] ?? 'Unknown User';
 
+                  // Privacy: full name only once a hire exists between you two.
+                  return ListenableBuilder(
+                    listenable: HiredContacts.instance,
+                    builder: (context, _) {
+                  final shownName = HiredContacts.instance.nameFor(otherUid, otherName);
                   return ListTile(
                     contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
                     leading: CircleAvatar(
                       backgroundColor: AppColors.primary.withOpacity(0.1),
-                      child: Text(otherName[0].toUpperCase(), style: const TextStyle(color: AppColors.primary, fontWeight: FontWeight.bold)),
+                      child: Text(NameUtils.initial(shownName), style: const TextStyle(color: AppColors.primary, fontWeight: FontWeight.bold)),
                     ),
-                    title: Text(otherName, style: const TextStyle(fontWeight: FontWeight.bold)),
+                    title: Text(shownName, style: const TextStyle(fontWeight: FontWeight.bold)),
                     subtitle: Text(
                       chatData['lastMessage'] ?? '',
                       maxLines: 1,
@@ -95,6 +102,8 @@ class _ChatListScreenState extends State<ChatListScreen> {
                       Navigator.push(context, MaterialPageRoute(
                         builder: (_) => ChatScreen(chatId: chats[index].id, otherUid: otherUid, otherName: otherName)
                       ));
+                    },
+                  );
                     },
                   );
                 }

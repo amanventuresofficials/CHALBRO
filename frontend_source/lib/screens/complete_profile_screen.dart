@@ -43,12 +43,57 @@ class _CompleteProfileScreenState extends State<CompleteProfileScreen> {
   // ── Save ──────────────────────────────────────────────────────────────────
   bool _isLoading = false;
 
+  // ── "What's still missing" helpers ────────────────────────────────────────
+  final _nameKey = GlobalKey();
+  final _phoneRowKey = GlobalKey();
+  final _nameFocus = FocusNode();
+  final _phoneFocus = FocusNode();
+  final _otpFocus = FocusNode();
+  String? _phoneError;
+  String? _otpError;
+  // Turns on after the first "Save & Continue" with something missing; from then on
+  // the checklist banner stays up and updates live as the fields get filled in.
+  bool _showMissing = false;
+
+  /// Required things not filled in yet, in the order they appear on screen.
+  List<_MissingItem> _missingItems() {
+    return [
+      if (_nameController.text.trim().isEmpty)
+        _MissingItem('Full name', _jumpToName),
+      if (_verifiedPhone.isEmpty)
+        _MissingItem('Phone number verification', _jumpToPhone),
+    ];
+  }
+
+  void _jumpToName() {
+    final ctx = _nameKey.currentContext;
+    if (ctx != null) {
+      Scrollable.ensureVisible(ctx,
+          duration: const Duration(milliseconds: 300), alignment: 0.15);
+    }
+    _nameFocus.requestFocus();
+  }
+
+  void _jumpToPhone() {
+    setState(() {
+      _currentStep = 1;
+      _phoneError = null;
+    });
+    // The phone field only exists once the verification step has been built.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && !_isOtpSent) _phoneFocus.requestFocus();
+    });
+  }
+
   @override
   void initState() {
     super.initState();
     final currentUser = FirebaseAuth.instance.currentUser;
     _nameController =
         TextEditingController(text: currentUser?.displayName ?? '');
+    _nameController.addListener(() {
+      if (_showMissing && mounted) setState(() {});
+    });
 
     // If user signed in via phone, their number is already verified –
     // prefill and skip the OTP step.
@@ -69,6 +114,9 @@ class _CompleteProfileScreenState extends State<CompleteProfileScreen> {
     _phoneController.dispose();
     _otpController.dispose();
     _qualificationsController.dispose();
+    _nameFocus.dispose();
+    _phoneFocus.dispose();
+    _otpFocus.dispose();
     super.dispose();
   }
 
@@ -145,12 +193,18 @@ class _CompleteProfileScreenState extends State<CompleteProfileScreen> {
   void _sendOTP() async {
     final phone = _phoneController.text.trim();
     if (phone.length < 10) {
-      ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Enter a valid 10-digit phone number')));
+      // Say what is missing and put the cursor back in that field.
+      setState(() => _phoneError = phone.isEmpty
+          ? 'Enter your 10-digit phone number to continue'
+          : 'Phone number needs 10 digits — you entered ${phone.length}');
+      _phoneFocus.requestFocus();
       return;
     }
 
-    setState(() => _isPhoneLoading = true);
+    setState(() {
+      _phoneError = null;
+      _isPhoneLoading = true;
+    });
 
     final fullPhone = phone.startsWith('+') ? phone : '+91$phone';
 
@@ -186,12 +240,17 @@ class _CompleteProfileScreenState extends State<CompleteProfileScreen> {
   void _verifyOTP() async {
     final otp = _otpController.text.trim();
     if (otp.length < 6 || _verificationId == null) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('Enter the 6-digit OTP')));
+      setState(() => _otpError = otp.isEmpty
+          ? 'Enter the 6-digit OTP we sent to your phone'
+          : 'The OTP has 6 digits — you entered ${otp.length}');
+      _otpFocus.requestFocus();
       return;
     }
 
-    setState(() => _isPhoneLoading = true);
+    setState(() {
+      _otpError = null;
+      _isPhoneLoading = true;
+    });
 
     try {
       // Link the verified phone credential to the existing Google account
@@ -235,12 +294,17 @@ class _CompleteProfileScreenState extends State<CompleteProfileScreen> {
 
   // ── Submit profile ────────────────────────────────────────────────────────
   void _submitProfile() async {
-    // Make sure phone is verified before saving
-    if (_verifiedPhone.isEmpty) {
-      // Navigate to phone verify step
-      setState(() => _currentStep = 1);
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('Please verify your phone number first.')));
+    // Tell the user exactly what is still missing, then take them to the first item.
+    final missing = _missingItems();
+    if (missing.isNotEmpty) {
+      setState(() => _showMissing = true);
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(
+          content: Text('Still needed: ${missing.map((m) => m.label).join(', ')}'),
+          duration: const Duration(seconds: 4),
+        ));
+      missing.first.onTap();
       return;
     }
 
@@ -278,6 +342,26 @@ class _CompleteProfileScreenState extends State<CompleteProfileScreen> {
     }
   }
 
+  /// Lets someone who signed in with the wrong account (or phone) back out.
+  /// Signing out returns to the login screen automatically.
+  Future<void> _confirmLogout() async {
+    final sure = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Logout?'),
+        content: const Text('You will go back to the login screen. What you have typed on this page will be lost.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Stay')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Logout', style: TextStyle(color: AppColors.red, fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+    if (sure == true) await _authService.signOut();
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
@@ -302,6 +386,14 @@ class _CompleteProfileScreenState extends State<CompleteProfileScreen> {
                 }),
               )
             : null,
+        actions: [
+          TextButton.icon(
+            onPressed: _isLoading ? null : _confirmLogout,
+            icon: const Icon(Icons.logout_rounded, color: Colors.white, size: 18),
+            label: const Text('Logout', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+          ),
+          const SizedBox(width: 4),
+        ],
       ),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
@@ -323,24 +415,36 @@ class _CompleteProfileScreenState extends State<CompleteProfileScreen> {
               'Tell us a bit more about yourself to start using Chalbro.',
               style: TextStyle(color: AppColors.greyText, fontSize: 14),
             ),
-            const SizedBox(height: 24),
+            const SizedBox(height: 16),
+
+            // Checklist of what is still missing (appears after a failed save).
+            _buildMissingBanner(),
+
+            const SizedBox(height: 8),
 
             // Full Name
             TextFormField(
+              key: _nameKey,
               controller: _nameController,
+              focusNode: _nameFocus,
+              textCapitalization: TextCapitalization.words,
+              autovalidateMode: _showMissing
+                  ? AutovalidateMode.always
+                  : AutovalidateMode.disabled,
               decoration: InputDecoration(
                   labelText: 'Full Name',
                   border: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(16)),
                   contentPadding: const EdgeInsets.symmetric(
                       horizontal: 16, vertical: 16)),
-              validator: (val) =>
-                  val!.isEmpty ? 'Please enter your full name' : null,
+              validator: (val) => (val ?? '').trim().isEmpty
+                  ? 'Please enter your full name'
+                  : null,
             ),
             const SizedBox(height: 16),
 
             // Phone Number (shows verified badge OR verify button)
-            _buildPhoneRow(),
+            KeyedSubtree(key: _phoneRowKey, child: _buildPhoneRow()),
             const SizedBox(height: 16),
 
             // Gender
@@ -526,14 +630,66 @@ class _CompleteProfileScreenState extends State<CompleteProfileScreen> {
     );
   }
 
+  /// "Almost there — still needed: …" with a tappable chip per missing item.
+  Widget _buildMissingBanner() {
+    final missing = _missingItems();
+    if (!_showMissing || missing.isEmpty) return const SizedBox.shrink();
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      margin: const EdgeInsets.only(bottom: 8),
+      decoration: BoxDecoration(
+        color: Colors.orange.shade50,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.orange.shade300),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.info_outline, color: Colors.orange.shade800, size: 18),
+              const SizedBox(width: 8),
+              Text(
+                'Almost there — still needed:',
+                style: TextStyle(
+                    fontWeight: FontWeight.bold, color: Colors.orange.shade900),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 4,
+            children: [
+              for (final item in missing)
+                ActionChip(
+                  avatar: Icon(Icons.arrow_forward_rounded,
+                      size: 16, color: Colors.orange.shade900),
+                  label: Text(item.label),
+                  backgroundColor: Colors.white,
+                  side: BorderSide(color: Colors.orange.shade300),
+                  onPressed: item.onTap,
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildPhoneRow() {
     final bool verified = _verifiedPhone.isNotEmpty;
+    final bool flagged = _showMissing && !verified;
 
     return Container(
       decoration: BoxDecoration(
         border: Border.all(
-          color: verified ? AppColors.success : Colors.grey.shade400,
-          width: 1.2,
+          color: verified
+              ? AppColors.success
+              : (flagged ? Colors.orange.shade700 : Colors.grey.shade400),
+          width: flagged ? 2 : 1.2,
         ),
         borderRadius: BorderRadius.circular(16),
       ),
@@ -625,11 +781,16 @@ class _CompleteProfileScreenState extends State<CompleteProfileScreen> {
             // Phone input
             TextField(
               controller: _phoneController,
+              focusNode: _phoneFocus,
               keyboardType: TextInputType.phone,
               maxLength: 10,
               style: const TextStyle(fontSize: 16),
+              onChanged: (_) {
+                if (_phoneError != null) setState(() => _phoneError = null);
+              },
               decoration: InputDecoration(
                 labelText: 'Phone Number',
+                errorText: _phoneError,
                 prefixText: '+91  ',
                 counterText: '',
                 border: OutlineInputBorder(
@@ -665,6 +826,7 @@ class _CompleteProfileScreenState extends State<CompleteProfileScreen> {
             const SizedBox(height: 20),
             TextField(
               controller: _otpController,
+              focusNode: _otpFocus,
               keyboardType: TextInputType.number,
               maxLength: 6,
               textAlign: TextAlign.center,
@@ -672,7 +834,11 @@ class _CompleteProfileScreenState extends State<CompleteProfileScreen> {
                   fontSize: 28,
                   letterSpacing: 12,
                   fontWeight: FontWeight.bold),
+              onChanged: (_) {
+                if (_otpError != null) setState(() => _otpError = null);
+              },
               decoration: InputDecoration(
+                errorText: _otpError,
                 counterText: '',
                 hintText: '––––––',
                 hintStyle: TextStyle(
@@ -725,4 +891,11 @@ class _CompleteProfileScreenState extends State<CompleteProfileScreen> {
       ),
     );
   }
+}
+
+/// One required thing the user hasn't filled in yet, and how to jump to it.
+class _MissingItem {
+  final String label;
+  final VoidCallback onTap;
+  const _MissingItem(this.label, this.onTap);
 }

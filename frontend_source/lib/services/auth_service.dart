@@ -5,7 +5,12 @@ import 'package:flutter/foundation.dart';
 
 class AuthService {
   final FirebaseAuth _auth = FirebaseAuth.instance;
-  final GoogleSignIn _googleSignIn = GoogleSignIn();
+
+  // Created on first use, which only ever happens on Android/iOS. On the web the
+  // google_sign_in plugin starts loading the moment the object exists and fails
+  // with "ClientID not set" (an "Uncaught Error" every time a screen creates an
+  // AuthService), while web sign-in goes through Firebase's own popup instead.
+  late final GoogleSignIn _googleSignIn = GoogleSignIn();
 
   // Stream to listen to authentication state changes
   Stream<User?> get user => _auth.authStateChanges();
@@ -58,6 +63,14 @@ class AuthService {
         codeSent(confirmation.verificationId, null);
       } on FirebaseAuthException catch (e) {
         verificationFailed(e);
+      } catch (e) {
+        // A browser/script problem (not a Firebase answer) must not leave the
+        // "Send OTP" spinner running forever.
+        debugPrint('❌ Phone verification failed: $e');
+        verificationFailed(FirebaseAuthException(
+          code: 'unknown',
+          message: 'Could not send the OTP. Please check your connection and try again.',
+        ));
       }
       return;
     }

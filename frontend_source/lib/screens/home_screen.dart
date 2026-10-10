@@ -1,10 +1,13 @@
 import 'package:flutter/material.dart';
+import '../services/payment_mode_service.dart';
+import '../utils/wallet_balance.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:provider/provider.dart';
 import '../services/database_service.dart';
 import '../utils/app_colors.dart';
 import '../utils/language_provider.dart';
+import '../utils/name_utils.dart';
 import 'post_task_screen.dart';
 import 'notifications_screen.dart';
 import 'public_profile_screen.dart';
@@ -144,15 +147,17 @@ class _HomeScreenState extends State<HomeScreen> {
         stream: FirebaseFirestore.instance.collection('users').doc(currentUid).snapshots(),
         builder: (context, snapshot) {
           int tasksDone = 0;
-          int walletBalance = 0;
+          Map<String, dynamic>? userData;
           final s = context.watch<LanguageProvider>().strings;
           if (snapshot.hasData && snapshot.data!.exists) {
             final data = snapshot.data!.data() as Map<String, dynamic>;
             tasksDone = data['tasksDone'] ?? 0;
-            walletBalance = (data['walletBalance'] ?? 0).toInt();
+            userData = data;
           }
           
-          return Row(
+          return ValueListenableBuilder<bool>(
+            valueListenable: PaymentModeService.instance.razorpayOn,
+            builder: (context, razorpayOn, _) => Row(
             children: [
               Expanded(
                 child: Container(
@@ -185,14 +190,14 @@ class _HomeScreenState extends State<HomeScreen> {
                     children: [
                       const Icon(Icons.account_balance_wallet_outlined, color: AppColors.success),
                       const SizedBox(height: 8),
-                      Text('₹$walletBalance', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: AppColors.success)),
+                      Text('₹${balanceToShow(userData, razorpayOn: razorpayOn)}', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: AppColors.success)),
                       Text(s.homeWalletBalance, style: const TextStyle(fontSize: 12, color: AppColors.greyText)),
                     ],
                   ),
                 ),
               ),
             ],
-          );
+          ));
         },
       ),
     );
@@ -339,13 +344,13 @@ class _HomeScreenState extends State<HomeScreen> {
                         radius: 30,
                         backgroundColor: AppColors.primary.withOpacity(0.8),
                         child: Text(
-                          (data['fullName'] ?? 'U')[0].toUpperCase(),
+                          NameUtils.initial(data['fullName'] ?? 'U'),
                           style: const TextStyle(color: Colors.white, fontSize: 24),
                         ),
                       ),
                       const SizedBox(height: 12),
                       Text(
-                        data['fullName'] ?? 'User',
+                        NameUtils.firstName(data['fullName'] ?? 'User'),
                         style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
@@ -449,14 +454,22 @@ class _HomeScreenState extends State<HomeScreen> {
           if (data['postedByUid'] == currentUid) return false;
           if (data['status'] != 'open') return false;
           return true;
-        }).take(3).toList();
+        }).toList()
+          ..sort((a, b) {
+            final ta = (a.data() as Map<String, dynamic>)['createdAt'];
+            final tb = (b.data() as Map<String, dynamic>)['createdAt'];
+            final da = ta is Timestamp ? ta.millisecondsSinceEpoch : 0;
+            final db = tb is Timestamp ? tb.millisecondsSinceEpoch : 0;
+            return db.compareTo(da); // newest first
+          });
+        final latestTasks = tasks.take(3).toList();
 
-        if (tasks.isEmpty) return const Padding(padding: EdgeInsets.all(20), child: Text('No open tasks near you.'));
+        if (latestTasks.isEmpty) return const Padding(padding: EdgeInsets.all(20), child: Text('No open tasks near you.'));
 
         return Padding(
           padding: const EdgeInsets.symmetric(horizontal: 20),
           child: Column(
-            children: tasks.map((doc) {
+            children: latestTasks.map((doc) {
               final task = doc.data() as Map<String, dynamic>;
               return GestureDetector(
                 onTap: () {

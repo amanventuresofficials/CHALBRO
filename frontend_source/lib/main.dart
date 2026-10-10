@@ -8,7 +8,12 @@ import 'screens/complete_profile_screen.dart';
 import 'screens/terms_screen.dart';
 import 'screens/blocked_screen.dart';
 import 'auth_screen.dart';
+import 'screens/app_gate_screens.dart';
+import 'services/app_config_service.dart';
+import 'services/payment_mode_service.dart';
 import 'services/auth_service.dart';
+import 'services/error_logger.dart';
+import 'utils/app_info.dart';
 import 'utils/app_colors.dart';
 import 'utils/language_provider.dart';
 import 'widgets/language_picker_dialog.dart';
@@ -27,6 +32,11 @@ void main() async {
   await Firebase.initializeApp(
     options: DefaultFirebaseOptions.currentPlatform,
   );
+  // Version info + error reporting for the admin panel's "Errors & Health" screen.
+  await AppInfo.init();
+  ErrorLogger.instance.install();
+  AppConfigService.instance.start();
+  PaymentModeService.instance.start();
   runApp(
     ChangeNotifierProvider(
       create: (_) => LanguageProvider(),
@@ -75,8 +85,18 @@ class AuthWrapper extends StatelessWidget {
           return const AuthScreen();
         }
 
-        // Logged in → watch Firestore user document
-        return StreamBuilder<DocumentSnapshot>(
+        // Logged in → first the owner's switches (maintenance / update required /
+        // sign-ups closed, set in the admin panel), then the user's own document.
+        return ValueListenableBuilder<AppConfig>(
+          valueListenable: AppConfigService.instance.config,
+          builder: (context, config, _) {
+            if (config.maintenanceMode) {
+              return MaintenanceScreen(message: config.maintenanceMessage);
+            }
+            if (config.needsUpdate()) {
+              return const UpdateRequiredScreen();
+            }
+            return StreamBuilder<DocumentSnapshot>(
           stream: FirebaseFirestore.instance
               .collection('users')
               .doc(authSnapshot.data!.uid)
@@ -119,6 +139,12 @@ class AuthWrapper extends StatelessWidget {
               }
             }
 
+            // --- GATE 0.5: sign-ups switched off by the owner ---
+            // Only people who have NO account yet are turned away.
+            if (!docExists && !config.allowNewRegistrations) {
+              return const RegistrationsClosedScreen();
+            }
+
             // --- GATE 1: Terms & Conditions ---
             // If the user document doesn't exist yet OR termsAccepted is not true,
             // force them to read and accept the terms first.
@@ -143,6 +169,8 @@ class AuthWrapper extends StatelessWidget {
               return _LanguagePickerGate();
             }
             return const MainLayout();
+          },
+            );
           },
         );
       },

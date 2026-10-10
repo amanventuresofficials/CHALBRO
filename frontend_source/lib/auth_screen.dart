@@ -23,6 +23,10 @@ class _AuthScreenState extends State<AuthScreen>
   // Phone Auth State
   final TextEditingController _phoneController = TextEditingController();
   final TextEditingController _otpController = TextEditingController();
+  final FocusNode _phoneFocus = FocusNode();
+  final FocusNode _otpFocus = FocusNode();
+  String? _phoneError;
+  String? _otpError;
   bool _isPhoneLoading = false;
   bool _isOtpSent = false;
   String? _verificationId;
@@ -46,6 +50,8 @@ class _AuthScreenState extends State<AuthScreen>
   void dispose() {
     _phoneController.dispose();
     _otpController.dispose();
+    _phoneFocus.dispose();
+    _otpFocus.dispose();
     _fadeController.dispose();
     super.dispose();
   }
@@ -65,17 +71,22 @@ class _AuthScreenState extends State<AuthScreen>
 
   // ── Phone: Send OTP ────────────────────────────────────────────────────────
   void _handleSendOTP() async {
-    // Dismiss keyboard first to avoid layout jumps
-    FocusScope.of(context).unfocus();
-
     final phone = _phoneController.text.trim();
     if (phone.isEmpty || phone.length < 10) {
-      ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Enter a valid 10-digit phone number')));
+      // Say what is missing and put the cursor back in that field.
+      setState(() => _phoneError = phone.isEmpty
+          ? 'Enter your 10-digit phone number to continue'
+          : 'Phone number needs 10 digits — you entered ${phone.length}');
+      _phoneFocus.requestFocus();
       return;
     }
 
-    setState(() => _isPhoneLoading = true);
+    // Dismiss keyboard first to avoid layout jumps
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _phoneError = null;
+      _isPhoneLoading = true;
+    });
 
     final fullPhone = phone.startsWith('+') ? phone : '+91$phone';
 
@@ -110,16 +121,20 @@ class _AuthScreenState extends State<AuthScreen>
 
   // ── Phone: Verify OTP ──────────────────────────────────────────────────────
   void _handleVerifyOTP() async {
-    FocusScope.of(context).unfocus();
-
     final otp = _otpController.text.trim();
-    if (otp.isEmpty || _verificationId == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Please enter the OTP')));
+    if (otp.length < 6 || _verificationId == null) {
+      setState(() => _otpError = otp.isEmpty
+          ? 'Enter the 6-digit OTP we sent to your phone'
+          : 'The OTP has 6 digits — you entered ${otp.length}');
+      _otpFocus.requestFocus();
       return;
     }
 
-    setState(() => _isPhoneLoading = true);
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _otpError = null;
+      _isPhoneLoading = true;
+    });
 
     final userCredential =
         await _authService.signInWithOTP(_verificationId!, otp);
@@ -136,6 +151,8 @@ class _AuthScreenState extends State<AuthScreen>
     setState(() {
       _activeMethod = method;
       _isOtpSent = false;
+      _phoneError = null;
+      _otpError = null;
       _phoneController.clear();
       _otpController.clear();
     });
@@ -342,6 +359,11 @@ class _AuthScreenState extends State<AuthScreen>
                         if (!_isOtpSent) ...[
                           _WhiteTextField(
                             controller: _phoneController,
+                            focusNode: _phoneFocus,
+                            errorText: _phoneError,
+                            onChanged: () {
+                              if (_phoneError != null) setState(() => _phoneError = null);
+                            },
                             hintText: 'Phone number (e.g. 9876543210)',
                             prefixText: '+91  ',
                             icon: Icons.phone_android_rounded,
@@ -360,6 +382,11 @@ class _AuthScreenState extends State<AuthScreen>
                           // OTP field
                           _WhiteTextField(
                             controller: _otpController,
+                            focusNode: _otpFocus,
+                            errorText: _otpError,
+                            onChanged: () {
+                              if (_otpError != null) setState(() => _otpError = null);
+                            },
                             hintText: 'Enter 6-digit OTP',
                             icon: Icons.lock_outline_rounded,
                             keyboardType: TextInputType.number,
@@ -527,6 +554,9 @@ class _WhiteTextField extends StatelessWidget {
   final IconData icon;
   final TextInputType? keyboardType;
   final int? maxLength;
+  final FocusNode? focusNode;
+  final String? errorText;
+  final VoidCallback? onChanged;
 
   const _WhiteTextField({
     required this.controller,
@@ -535,14 +565,23 @@ class _WhiteTextField extends StatelessWidget {
     required this.icon,
     this.keyboardType,
     this.maxLength,
+    this.focusNode,
+    this.errorText,
+    this.onChanged,
   });
 
   @override
   Widget build(BuildContext context) {
+    final errorBorder = OutlineInputBorder(
+      borderRadius: BorderRadius.circular(16),
+      borderSide: const BorderSide(color: Colors.orangeAccent, width: 2),
+    );
     return TextField(
       controller: controller,
+      focusNode: focusNode,
       keyboardType: keyboardType,
       maxLength: maxLength,
+      onChanged: onChanged == null ? null : (_) => onChanged!(),
       style: const TextStyle(fontSize: 16, color: Colors.black87),
       decoration: InputDecoration(
         hintText: hintText,
@@ -554,6 +593,12 @@ class _WhiteTextField extends StatelessWidget {
           borderRadius: BorderRadius.circular(16),
           borderSide: BorderSide.none,
         ),
+        errorText: errorText,
+        // The screen background is a purple gradient, so errors are white (red would not read).
+        errorStyle: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 13),
+        errorMaxLines: 2,
+        errorBorder: errorBorder,
+        focusedErrorBorder: errorBorder,
         prefixIcon: Icon(icon, color: AppColors.primary),
         contentPadding:
             const EdgeInsets.symmetric(horizontal: 16, vertical: 18),

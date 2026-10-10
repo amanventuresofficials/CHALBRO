@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../utils/app_colors.dart';
 import '../services/database_service.dart';
+import '../utils/name_utils.dart';
 import 'public_profile_screen.dart';
 import 'chat_screen.dart';
 
@@ -107,7 +108,9 @@ class TaskApplicantsScreen extends StatelessWidget {
 
                     final userData = snapshot.data!.data() as Map<String, dynamic>;
                     String fullName = userData['fullName'] ?? 'Unknown Helper';
-                    
+                    // Privacy: applicants haven't been hired yet, so show first name only.
+                    final String displayName = NameUtils.firstName(fullName);
+
                     double ratingSum = (userData['ratingSum'] ?? 0).toDouble();
                     int ratingCount = userData['ratingCount'] ?? 0;
                     double trustScore = ratingCount == 0 ? 5.0 : (ratingSum / ratingCount);
@@ -145,7 +148,7 @@ class TaskApplicantsScreen extends StatelessWidget {
                                 child: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
-                                    Text(fullName, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: AppColors.darkText)),
+                                    Text(displayName, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: AppColors.darkText)),
                                     const SizedBox(height: 4),
                                     Row(
                                       children: [
@@ -198,7 +201,7 @@ class TaskApplicantsScreen extends StatelessWidget {
                                 child: SizedBox(
                                   height: 48,
                                   child: ElevatedButton(
-                                    onPressed: () => _confirmAssign(context, helperUid, fullName, bidPrice),
+                                    onPressed: () => _confirmAssign(context, helperUid, displayName, bidPrice),
                                     style: ElevatedButton.styleFrom(
                                       backgroundColor: AppColors.success,
                                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),

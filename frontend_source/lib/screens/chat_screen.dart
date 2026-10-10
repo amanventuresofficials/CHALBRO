@@ -3,6 +3,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:intl/intl.dart';
 import '../services/database_service.dart';
+import '../services/hired_contacts.dart';
 import '../utils/app_colors.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -45,7 +46,14 @@ class _ChatScreenState extends State<ChatScreen> {
     return Scaffold(
       backgroundColor: AppColors.background,
       appBar: AppBar(
-        title: Text(widget.otherName, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        // Privacy: full name only once a hire exists between you two.
+        title: ListenableBuilder(
+          listenable: HiredContacts.instance,
+          builder: (context, _) => Text(
+            HiredContacts.instance.nameFor(widget.otherUid, widget.otherName),
+            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+          ),
+        ),
         backgroundColor: AppColors.primary,
         foregroundColor: Colors.white,
       ),

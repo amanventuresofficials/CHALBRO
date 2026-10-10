@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 import '../utils/app_colors.dart';
 import '../utils/app_strings.dart';
 import '../utils/language_provider.dart';
+import '../utils/name_utils.dart';
 import '../services/database_service.dart';
 import 'post_task_screen.dart';
 import 'leaderboard_screen.dart';
@@ -182,7 +183,9 @@ class _FindHelpersScreenState extends State<FindHelpersScreen> {
                       final helper =
                           helpers[index].data() as Map<String, dynamic>;
 
-                      String fullName = helper['fullName'] ?? 'Unknown';
+                      // Privacy: only the first name is shown until this helper is hired.
+                      final String displayName =
+                          NameUtils.firstName(helper['fullName'] ?? 'Helper');
                       double ratingSum = (helper['ratingSum'] ?? 0).toDouble();
                       int ratingCount = helper['ratingCount'] ?? 0;
                       double trustScore =
@@ -245,20 +248,12 @@ class _FindHelpersScreenState extends State<FindHelpersScreen> {
                                       crossAxisAlignment:
                                           CrossAxisAlignment.start,
                                       children: [
-                                        Text(fullName,
+                                        Text(displayName,
                                             style: const TextStyle(
                                                 fontSize: 16,
                                                 fontWeight: FontWeight.bold,
                                                 color: AppColors.darkText)),
-                                        const SizedBox(height: 4),
-                                        Text(
-                                            helper['qualifications'] ??
-                                                'Helper',
-                                            style: const TextStyle(
-                                                color: AppColors.primary,
-                                                fontWeight: FontWeight.w500,
-                                                fontSize: 13)),
-                                        const SizedBox(height: 4),
+                                        const SizedBox(height: 6),
                                         Row(
                                           children: [
                                             const Icon(Icons.star,
@@ -293,7 +288,7 @@ class _FindHelpersScreenState extends State<FindHelpersScreen> {
                                         MaterialPageRoute(
                                           builder: (context) => PostTaskScreen(
                                             targetHelperUid: helper['uid'],
-                                            targetHelperName: fullName,
+                                            targetHelperName: displayName,
                                           ),
                                         ),
                                       );

@@ -6,10 +6,12 @@
     "shell": "firebase functions:shell",
     "start": "npm run shell",
     "deploy": "firebase deploy --only functions",
-    "logs": "firebase functions:log"
+    "logs": "firebase functions:log",
+    "test": "node --test test/errorlog.test.js",
+    "test:e2e": "firebase emulators:exec --only firestore --project demo-chalbro \"node functions/test/payments.e2e.js\""
   },
   "engines": {
-    "node": "20"
+    "node": "22"
   },
   "main": "index.js",
   "dependencies": {

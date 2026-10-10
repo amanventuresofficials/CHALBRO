@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../utils/app_colors.dart';
+import '../services/app_config_service.dart';
 import '../services/database_service.dart';
 import '../utils/picked_image.dart';
 import 'package:image_picker/image_picker.dart';
@@ -317,7 +318,14 @@ class _PostTaskScreenState extends State<PostTaskScreen> {
                       controller: _priceController,
                       label: 'Budget (₹)',
                       keyboardType: TextInputType.number,
-                      validator: (val) => val!.isEmpty ? 'Enter your budget' : null,
+                      validator: (val) {
+                        final text = (val ?? '').trim();
+                        if (text.isEmpty) return 'Enter your budget';
+                        final amount = int.tryParse(text);
+                        if (amount == null || amount <= 0) return 'Enter the budget as a whole number of rupees';
+                        // Lowest / highest price the owner allows (admin panel > App Settings).
+                        return AppConfigService.instance.config.value.priceProblem(amount);
+                      },
                     ),
                     const SizedBox(height: 16),
                     DropdownButtonFormField<String>(

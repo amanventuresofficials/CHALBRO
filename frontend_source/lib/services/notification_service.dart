@@ -2,6 +2,7 @@ import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
+import 'error_logger.dart';
 
 class NotificationService {
   final FirebaseMessaging _firebaseMessaging = FirebaseMessaging.instance;
@@ -46,8 +47,10 @@ class NotificationService {
         'fcmTokens': FieldValue.arrayUnion([token]),
       }, SetOptions(merge: true));
       debugPrint('FCM Token saved: $token');
-    } catch (e) {
+    } catch (e, st) {
       debugPrint('Failed to save FCM token: $e');
+      ErrorLogger.instance.log(
+          error: e, stack: st, category: 'database', severity: 'warning', context: 'Save push-notification token');
     }
   }
 }

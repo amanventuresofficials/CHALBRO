@@ -5,7 +5,6 @@ import '../utils/app_colors.dart';
 import '../services/database_service.dart';
 import 'task_details_screen.dart';
 import 'chat_screen.dart';
-import 'public_profile_screen.dart';
 
 class MyTasksScreen extends StatefulWidget {
   const MyTasksScreen({super.key});
@@ -245,15 +244,12 @@ class _MyTasksScreenState extends State<MyTasksScreen> {
 
     // Shows all tasks where the user is involved (applied, offered, or assigned)
     final uid = FirebaseAuth.instance.currentUser?.uid;
-    return StreamBuilder<QuerySnapshot>(
-      stream: FirebaseFirestore.instance
-          .collection('tasks')
-          .where('applicants', arrayContains: uid)
-          .snapshots(),
+    return StreamBuilder<List<QueryDocumentSnapshot>>(
+      stream: _db.streamMyWorkerTasks(),
       builder: (context, snapshot) {
         if (snapshot.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator(color: AppColors.primary));
-        
-        final List<QueryDocumentSnapshot> allTasks = snapshot.hasData ? snapshot.data!.docs.toList() : [];
+
+        final List<QueryDocumentSnapshot> allTasks = snapshot.hasData ? snapshot.data!.toList() : [];
         _sortTasks(allTasks);
 
         // Filter out tasks assigned to SOMEONE ELSE
@@ -368,15 +364,19 @@ class _MyTasksScreenState extends State<MyTasksScreen> {
                             ),
                           ),
                           const SizedBox(width: 8),
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                            decoration: BoxDecoration(
-                              color: statusColor.withOpacity(0.1),
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            child: Text(
-                              status.toUpperCase().replaceAll('_', ' '),
-                              style: TextStyle(color: statusColor, fontSize: 10, fontWeight: FontWeight.bold),
+                          Flexible(
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: statusColor.withOpacity(0.1),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Text(
+                                status.toUpperCase().replaceAll('_', ' '),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(color: statusColor, fontSize: 10, fontWeight: FontWeight.bold),
+                              ),
                             ),
                           ),
                           const SizedBox(width: 8),

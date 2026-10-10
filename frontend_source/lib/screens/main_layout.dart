@@ -12,6 +12,7 @@ import 'profile_screen.dart';
 import 'find_work_screen.dart';
 import 'find_helpers_screen.dart';
 import '../services/notification_service.dart';
+import '../services/hired_contacts.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'dart:async';
 
@@ -32,6 +33,7 @@ class _MainLayoutState extends State<MainLayout> {
     super.initState();
     _dbService.cleanupExpiredTasks();
     NotificationService().init();
+    HiredContacts.instance.start();
 
     _connectivitySubscription = Connectivity().onConnectivityChanged.listen((List<ConnectivityResult> results) {
       final hasInternet = !results.contains(ConnectivityResult.none);

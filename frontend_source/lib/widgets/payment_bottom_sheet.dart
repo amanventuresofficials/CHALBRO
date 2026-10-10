@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../services/database_service.dart';
 import '../services/razorpay_service.dart';
 import '../utils/app_colors.dart';
+import '../utils/payment_amounts.dart';
 import 'razorpay_simulation_sheet.dart';
 
 /// Shows the task-payment sheet and drives it to completion.
@@ -51,6 +52,10 @@ Future<void> showPaymentBottomSheet({
 
   if (!context.mounted) return;
   double givenRating = 5.0;
+
+  // Admin-set discount: the poster pays less; the helper still earns on the full price.
+  final int discountPercent = (config['discountPercent'] as int?) ?? 0;
+  final amounts = PaymentAmounts.compute(amount, discountPercent);
 
   return showModalBottomSheet(
     context: context,
@@ -112,12 +117,22 @@ Future<void> showPaymentBottomSheet({
                           Text('₹$amount', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
                         ],
                       ),
+                      if (amounts.discountAmount > 0) ...[
+                        const SizedBox(height: 10),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text('Discount (${amounts.discountPercent}%)', style: const TextStyle(color: AppColors.success, fontWeight: FontWeight.w600)),
+                            Text('-₹${amounts.discountAmount}', style: const TextStyle(color: AppColors.success, fontWeight: FontWeight.bold, fontSize: 16)),
+                          ],
+                        ),
+                      ],
                       const Divider(height: 24),
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
                           const Text('Total to Pay', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                          Text('₹$amount', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 20, color: AppColors.primary)),
+                          Text('₹${amounts.payable}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 20, color: AppColors.primary)),
                         ],
                       ),
                     ],
@@ -159,7 +174,6 @@ Future<void> showPaymentBottomSheet({
                             final razorpay = RazorpayService();
                             razorpay.payForTask(
                               taskId: taskId,
-                              workerUid: workerUid,
                               givenRating: givenRating,
                               posterName: posterName,
                               posterContact: posterContact,
@@ -175,11 +189,12 @@ Future<void> showPaymentBottomSheet({
                           } else {
                             RazorpaySimulationSheet.show(
                               context,
-                              amount: amount,
+                              amount: amounts.payable,
                               title: 'Task Payment',
                               onSuccess: () async {
-                                final result = await DatabaseService()
-                                    .payAndCompleteTask(taskId, workerUid, amount, givenRating);
+                                final result = await DatabaseService().payAndCompleteTask(
+                                    taskId, workerUid, amount, givenRating,
+                                    discountPercent: discountPercent);
                                 onPaymentComplete(
                                   result == 'success',
                                   result == 'success' ? 'Task completed and worker paid!' : 'Payment failed: $result',
@@ -193,7 +208,7 @@ Future<void> showPaymentBottomSheet({
                           padding: const EdgeInsets.symmetric(vertical: 16),
                           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
                         ),
-                        child: Text('Pay ₹$amount', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
+                        child: Text('Pay ₹${amounts.payable}', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
                       ),
                     ),
                   ],

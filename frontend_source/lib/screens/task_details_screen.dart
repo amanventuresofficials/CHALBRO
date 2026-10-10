@@ -2,11 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import '../utils/app_colors.dart';
+import '../utils/name_utils.dart';
 import '../services/database_service.dart';
 import 'public_profile_screen.dart';
 import 'task_applicants_screen.dart';
 import '../widgets/payment_bottom_sheet.dart';
-import 'package:timeago/timeago.dart' as timeago;
+import '../widgets/report_sheet.dart';
 import 'chat_screen.dart';
 import 'package:intl/intl.dart';
 
@@ -95,6 +96,27 @@ class _TaskDetailsScreenState extends State<TaskDetailsScreen> {
     );
   }
 
+  /// Plain-words version of the stored task status.
+  static String _statusLabel(String status) {
+    switch (status) {
+      case 'open':
+        return 'OPEN';
+      case 'pending_worker_acceptance':
+        return 'WAITING FOR HELPER';
+      case 'pending_poster_acceptance':
+      case 'pending_acceptance':
+        return 'WAITING FOR POSTER';
+      case 'assigned':
+        return 'IN PROGRESS';
+      case 'completed':
+        return 'COMPLETED';
+      case 'expired':
+        return 'EXPIRED';
+      default:
+        return status.replaceAll('_', ' ').toUpperCase();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -108,9 +130,31 @@ class _TaskDetailsScreenState extends State<TaskDetailsScreen> {
       body: StreamBuilder<DocumentSnapshot>(
         stream: FirebaseFirestore.instance.collection('tasks').doc(widget.taskId).snapshots(),
         builder: (context, snapshot) {
-          if (snapshot.hasError) return Center(child: Text('Error: ${snapshot.error}'));
+          if (snapshot.hasError) {
+            // A task that has been hired out is private to the poster and the
+            // hired person; anyone else gets a permission error from Firestore.
+            final err = snapshot.error;
+            final bool noAccess = err is FirebaseException && err.code == 'permission-denied';
+            return Center(
+              child: Padding(
+                padding: const EdgeInsets.all(32),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(noAccess ? Icons.lock_outline : Icons.error_outline, size: 48, color: Colors.grey.shade400),
+                    const SizedBox(height: 12),
+                    Text(
+                      noAccess ? 'This task is no longer available.' : 'Could not load this task. Please try again.',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(fontSize: 16, color: Colors.grey),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          }
           if (snapshot.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
-          
+
           if (!snapshot.hasData || !snapshot.data!.exists) {
             return const Center(child: Text('Task not found.'));
           }
@@ -216,20 +260,28 @@ class _TaskDetailsScreenState extends State<TaskDetailsScreen> {
                                 Text('₹${task['price']}', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.black87)),
                               ],
                             ),
-                            Column(
-                              crossAxisAlignment: CrossAxisAlignment.end,
-                              children: [
-                                const Text('Status', style: TextStyle(color: Colors.grey, fontSize: 12)),
-                                const SizedBox(height: 4),
-                                Text(
-                                  status.toUpperCase(),
-                                  style: TextStyle(
-                                    fontSize: 16,
-                                    fontWeight: FontWeight.bold,
-                                    color: status == 'open' ? AppColors.primary : (status == 'completed' ? AppColors.success : Colors.orange),
+                            const SizedBox(width: 12),
+                            // Flexible + a readable label: raw values such as
+                            // "PENDING_WORKER_ACCEPTANCE" are one long word and ran off the card.
+                            Flexible(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.end,
+                                children: [
+                                  const Text('Status', style: TextStyle(color: Colors.grey, fontSize: 12)),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    _statusLabel(status),
+                                    textAlign: TextAlign.end,
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.bold,
+                                      color: status == 'open' ? AppColors.primary : (status == 'completed' ? AppColors.success : Colors.orange),
+                                    ),
                                   ),
-                                ),
-                              ],
+                                ],
+                              ),
                             ),
                           ],
                         ),
@@ -368,7 +420,14 @@ class _TaskDetailsScreenState extends State<TaskDetailsScreen> {
                             const Text('Posted by', style: TextStyle(color: Colors.grey, fontSize: 12)),
                             const SizedBox(height: 4),
                             Text(
-                              isMyTask ? 'You' : 'User-${posterUid.substring(0, 4).toUpperCase()}',
+                              isMyTask
+                                  ? 'You'
+                                  // Once you are the hired helper, you may see who you work for.
+                                  : (isAcceptedByMe &&
+                                          (status == 'assigned' || status == 'completed') &&
+                                          '${task['postedByName'] ?? ''}'.trim().isNotEmpty)
+                                      ? '${task['postedByName']}'.trim()
+                                      : 'User-${posterUid.substring(0, 4).toUpperCase()}',
                               style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.black87),
                             ),
                           ],
@@ -383,6 +442,12 @@ class _TaskDetailsScreenState extends State<TaskDetailsScreen> {
                     ],
                   ),
                 ),
+
+                // The helper you hired: their full details are revealed only now.
+                if (isMyTask && (status == 'assigned' || status == 'completed') && acceptedByUid.isNotEmpty) ...[
+                  const SizedBox(height: 16),
+                  _buildHiredHelperCard(acceptedByUid),
+                ],
 
                 const SizedBox(height: 32),
 
@@ -698,6 +763,23 @@ class _TaskDetailsScreenState extends State<TaskDetailsScreen> {
 
                 const SizedBox(height: 32),
 
+                // Anyone but the poster can flag this task for the admin team.
+                if (!isMyTask && posterUid.isNotEmpty)
+                  Center(
+                    child: TextButton.icon(
+                      onPressed: () => showReportSheet(
+                        context,
+                        targetType: 'task',
+                        targetId: widget.taskId,
+                        targetOwnerUid: posterUid,
+                        targetTitle: (task['title'] ?? '').toString(),
+                      ),
+                      icon: const Icon(Icons.flag_outlined, size: 18),
+                      label: const Text('Report this task'),
+                      style: TextButton.styleFrom(foregroundColor: Colors.grey),
+                    ),
+                  ),
+
                 // ---- TASK ACTIVITY LOG (Traceability) ----
                 _buildTaskActivityLog(),
 
@@ -707,6 +789,78 @@ class _TaskDetailsScreenState extends State<TaskDetailsScreen> {
           );
         },
       ),
+    );
+  }
+
+  Widget _buildHiredHelperCard(String helperUid) {
+    return FutureBuilder<DocumentSnapshot>(
+      future: FirebaseFirestore.instance.collection('users').doc(helperUid).get(),
+      builder: (context, snap) {
+        if (!snap.hasData || !snap.data!.exists) return const SizedBox.shrink();
+        final u = snap.data!.data() as Map<String, dynamic>;
+        final String name = u['fullName'] ?? 'Helper';
+        final String skills = u['qualifications'] ?? 'Not specified';
+        final String city = u['city'] ?? '';
+        final double ratingSum = (u['ratingSum'] ?? 0).toDouble();
+        final int ratingCount = u['ratingCount'] ?? 0;
+        final double rating = ratingCount == 0 ? 5.0 : ratingSum / ratingCount;
+
+        return GestureDetector(
+          onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => PublicProfileScreen(targetUid: helperUid))),
+          child: Container(
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(16),
+              boxShadow: [
+                BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10, offset: const Offset(0, 4)),
+              ],
+            ),
+            child: Row(
+              children: [
+                CircleAvatar(
+                  radius: 24,
+                  backgroundColor: AppColors.tertiary,
+                  child: Text(
+                    NameUtils.initial(name),
+                    style: const TextStyle(color: AppColors.primary, fontWeight: FontWeight.bold, fontSize: 20),
+                  ),
+                ),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('Hired helper', style: TextStyle(color: Colors.grey, fontSize: 12)),
+                      const SizedBox(height: 2),
+                      Text(name, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.black87)),
+                      const SizedBox(height: 2),
+                      Text(skills, style: const TextStyle(fontSize: 13, color: AppColors.primary)),
+                      if (city.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 2),
+                          child: Row(
+                            children: [
+                              const Icon(Icons.location_on_outlined, size: 13, color: Colors.grey),
+                              const SizedBox(width: 2),
+                              Text(city, style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                Column(
+                  children: [
+                    const Icon(Icons.star, color: Colors.orange, size: 16),
+                    Text(rating.toStringAsFixed(1), style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 

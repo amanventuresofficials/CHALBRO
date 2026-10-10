@@ -53,14 +53,147 @@ service cloud.firestore {
       return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
     }
 
+    // Same visibility rule as reading the task document itself; used for the
+    // task's subcollections, which can't see the parent's `resource`.
+    function canReadTask(taskId) {
+      let t = get(/databases/$(database)/documents/tasks/$(taskId)).data;
+      return t.status == 'open'
+        || t.postedByUid == request.auth.uid
+        || t.get('acceptedByUid', '') == request.auth.uid
+        || t.get('targetHelperUid', '') == request.auth.uid;
+    }
+
+
+    // ─── User document helpers ─────────────────────────────────────────────────
+
+    function changedUserKeys() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    // The owner editing their own profile. Not allowed to touch:
+    //  - moderation flags (isBanned, isPaused, canPost) -- admin only;
+    //  - idProofStatus, except to submit for review ('Pending Verification') or to
+    //    record that no ID has been uploaded yet -- never to approve themselves;
+    //  - walletBalance / ratingSum / ratingCount / tasksDone, except to be given
+    //    their standard starting values once, when the profile is first saved.
+    function isOwnerProfileEdit(userId) {
+      return isOwner(userId)
+        && !changedUserKeys().hasAny(['isBanned', 'isPaused', 'canPost'])
+        && (!changedUserKeys().hasAny(['idProofStatus'])
+            || request.resource.data.idProofStatus == 'Pending Verification'
+            || (!('idProofStatus' in resource.data)
+                && request.resource.data.idProofStatus == 'Not Uploaded'))
+        && (!changedUserKeys().hasAny(['walletBalance', 'realBalance', 'ratingSum', 'ratingCount', 'tasksDone'])
+            || startsWithStandardEconomy());
+    }
+
+    // Two separate balances live on the user document:
+    //   walletBalance = practice (test) credit, Rs 500 to start. Used while Razorpay is OFF.
+    //   realBalance   = real money earned through Razorpay payments, 0 to start. Only the
+    //                   payment Cloud Function (Admin SDK) and admins can ever raise it; the
+    //                   owner can only lower it, by withdrawing (see /withdrawals).
+    // True once the owner has switched Razorpay on (real money, so withdrawals are open).
+    function razorpayIsOn() {
+      return exists(/databases/$(database)/documents/metadata/paymentConfig)
+        && get(/databases/$(database)/documents/metadata/paymentConfig).data.get('useRazorpay', false) == true;
+    }
+
+    function startsWithStandardEconomy() {
+      return !('walletBalance' in resource.data)
+        && !('realBalance' in resource.data)
+        && request.resource.data.get('walletBalance', 500) == 500
+        && request.resource.data.get('realBalance', 0) == 0
+        && request.resource.data.get('ratingSum', 0) == 0
+        && request.resource.data.get('ratingCount', 0) == 0
+        && request.resource.data.get('tasksDone', 0) == 0;
+    }
+
+    // Payment flow (payAndCompleteTask): the poster lowers their OWN wallet and
+    // credits the helper they hired in one batch. Wallet top-ups are admin-only.
+    // Own rating numbers can't be touched; a helper's can only move by one task's
+    // worth (one rating of 1-5, one more task done). In production, replace with
+    // Cloud Functions using the Admin SDK.
+    function isPaymentWalletUpdate(userId) {
+      return isActiveUser()
+        && changedUserKeys().hasOnly(['walletBalance', 'realBalance', 'ratingSum', 'ratingCount', 'tasksDone'])
+        && ((userId == request.auth.uid
+              && !changedUserKeys().hasAny(['ratingSum', 'ratingCount', 'tasksDone'])
+              && request.resource.data.get('walletBalance', 0) <= resource.data.get('walletBalance', 0)
+              && request.resource.data.get('realBalance', 0) <= resource.data.get('realBalance', 0))
+            || (userId != request.auth.uid
+              && !changedUserKeys().hasAny(['realBalance'])
+              && request.resource.data.get('walletBalance', 0) >= resource.data.get('walletBalance', 0)
+              && request.resource.data.get('ratingCount', 0) - resource.data.get('ratingCount', 0) >= 0
+              && request.resource.data.get('ratingCount', 0) - resource.data.get('ratingCount', 0) <= 1
+              && request.resource.data.get('tasksDone', 0) - resource.data.get('tasksDone', 0) >= 0
+              && request.resource.data.get('tasksDone', 0) - resource.data.get('tasksDone', 0) <= 1
+              && request.resource.data.get('ratingSum', 0) - resource.data.get('ratingSum', 0) >= 0
+              && request.resource.data.get('ratingSum', 0) - resource.data.get('ratingSum', 0) <= 5));
+    }
 
     // ===== ADMINS COLLECTION =====
-    // SECURITY FIX: Only existing admins may write admin documents.
-    // New admins must be granted via Firebase Console or a Cloud Function
-    // using the Admin SDK — never from a client app.
+    // Only people who are ALREADY admins can add or remove admins (the admin panel's
+    // "Admin Team" screen). Nobody else can create an admin document, so the
+    // old self-registration hole stays closed. Anyone signed in can read their OWN
+    // document (that is how the panel checks "am I an admin?"); only admins can
+    // list the team. You cannot remove yourself, so the team is never left empty
+    // by a mis-click.
     match /admins/{adminId} {
-      allow read: if isAuthenticated() && request.auth.uid == adminId;
-      allow write: if false; // LOCKED — use Firebase Console or Admin SDK Cloud Function
+      allow read: if isAdmin() || (isAuthenticated() && request.auth.uid == adminId);
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasOnly(['email', 'displayName', 'role', 'createdAt', 'addedByUid', 'addedByEmail']);
+      allow update: if isAdmin();
+      allow delete: if isAdmin() && request.auth.uid != adminId;
+    }
+
+    // ===== ERROR LOGS (written by the mobile app, read by the admin panel) =====
+    // Any signed-in user's app may append an error record about THEIR OWN session.
+    // The shape and sizes are fixed so this can't be used to stuff the database;
+    // nobody but admins can read, change or delete them.
+    match /errorLogs/{logId} {
+      allow read, update, delete: if isAdmin();
+      allow create: if isAuthenticated()
+        && request.resource.data.keys().hasOnly(['category', 'severity', 'message', 'errorType', 'fingerprint',
+             'context', 'uid', 'appVersion', 'platform', 'status', 'source', 'createdAt', 'stack', 'taskId', 'extra'])
+        && request.resource.data.keys().hasAll(['category', 'severity', 'message', 'fingerprint', 'uid', 'status', 'createdAt'])
+        && request.resource.data.category in ['app', 'payment', 'database']
+        && request.resource.data.severity in ['fatal', 'error', 'warning']
+        && request.resource.data.status == 'open'
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.message is string && request.resource.data.message.size() <= 600
+        && request.resource.data.fingerprint is string && request.resource.data.fingerprint.size() <= 40
+        && (!('stack' in request.resource.data)
+            || (request.resource.data.stack is string && request.resource.data.stack.size() <= 4000))
+        && (!('context' in request.resource.data)
+            || (request.resource.data.context is string && request.resource.data.context.size() <= 200))
+        && (!('errorType' in request.resource.data)
+            || (request.resource.data.errorType is string && request.resource.data.errorType.size() <= 120))
+        && (!('extra' in request.resource.data)
+            || (request.resource.data.extra is map && request.resource.data.extra.size() <= 8));
+    }
+
+    // ===== REPORTS (a user flags a task or another user) =====
+    // One report per reporter per target (the document id says so, and nobody can
+    // overwrite it), so one person can't flood the queue. Only admins read them.
+    match /reports/{reportId} {
+      allow read, update, delete: if isAdmin();
+      allow create: if isActiveUser()
+        && request.resource.data.keys().hasOnly(['reporterUid', 'targetType', 'targetId', 'targetOwnerUid',
+             'targetTitle', 'reason', 'details', 'status', 'createdAt'])
+        && request.resource.data.keys().hasAll(['reporterUid', 'targetType', 'targetId', 'targetOwnerUid',
+             'reason', 'status', 'createdAt'])
+        && request.resource.data.reporterUid == request.auth.uid
+        && request.resource.data.targetOwnerUid != request.auth.uid
+        && request.resource.data.targetType in ['task', 'user']
+        && reportId == request.auth.uid + '_' + request.resource.data.targetType + '_' + request.resource.data.targetId
+        && request.resource.data.status == 'open'
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.reason in ['spam', 'abuse', 'fraud', 'fake', 'inappropriate', 'other']
+        && (!('details' in request.resource.data)
+            || (request.resource.data.details is string && request.resource.data.details.size() <= 500))
+        && (!('targetTitle' in request.resource.data)
+            || (request.resource.data.targetTitle is string && request.resource.data.targetTitle.size() <= 160));
     }
 
     // ===== ADMIN AUDIT LOGS =====
@@ -76,50 +209,35 @@ service cloud.firestore {
       // Any authenticated user can read user documents.
       allow read: if isAuthenticated();
 
-      // A user can create their own profile only if they're not banned.
-      // Admins can create/update any user doc.
-      allow create: if isOwner(userId) || isAdmin();
-
-      // Owner can update their own profile.
-      // Exception: moderation fields (isBanned, isPaused, canPost) are admin-only.
-      // ID proof fields (idProofUrl, idProofStatus) can be updated by owner ONLY when
-      // submitting for review — i.e. setting status to 'Pending Verification'.
-      // This prevents self-verification while still allowing photo re-uploads.
-      allow update: if isAdmin()
+      // Creating a profile: the owner may not set moderation flags, and may only
+      // start with the standard wallet/rating values (see startsWithStandardEconomy).
+      allow create: if isAdmin()
         || (isOwner(userId)
-            && !request.resource.data.diff(resource.data).affectedKeys()
-                .hasAny(['isBanned', 'isPaused', 'canPost'])
-            && (!request.resource.data.diff(resource.data).affectedKeys()
-                    .hasAny(['idProofStatus'])
-                || request.resource.data['idProofStatus'] == 'Pending Verification'));
+            && !request.resource.data.keys().hasAny(['isBanned', 'isPaused', 'canPost'])
+            && (!request.resource.data.keys().hasAny(['walletBalance', 'realBalance', 'ratingSum', 'ratingCount', 'tasksDone'])
+                || (request.resource.data.get('walletBalance', 500) == 500
+                    && request.resource.data.get('realBalance', 0) == 0
+                    && request.resource.data.get('ratingSum', 0) == 0
+                    && request.resource.data.get('ratingCount', 0) == 0
+                    && request.resource.data.get('tasksDone', 0) == 0)));
 
-      // Only admins can delete a user document.
-      allow delete: if isAdmin();
+      // Three ways a user document can be updated:
+      //  1. an admin (anything),
+      //  2. the owner editing their own profile (isOwnerProfileEdit),
+      //  3. the payment flow moving wallet / rating numbers (isPaymentWalletUpdate).
+      allow update: if isAdmin() || isOwnerProfileEdit(userId) || isPaymentWalletUpdate(userId);
 
-      // EXCEPTION: Allow wallet/rating updates for the payAndCompleteTask flow —
-      // the poster debits their OWN wallet and credits the WORKER's wallet in one
-      // batch. Wallet top-ups are admin-only (users start with a fixed simulated
-      // balance and cannot mint money into their own account from the client).
-      // In production: replace with Cloud Functions using Admin SDK.
-      allow update: if isActiveUser()
-        && request.resource.data.diff(resource.data).affectedKeys()
-          .hasOnly(['walletBalance', 'ratingSum', 'ratingCount', 'tasksDone'])
-        && (
-          // Paying for a task: caller may only decrease their OWN balance.
-          (userId == request.auth.uid
-            && request.resource.data.get('walletBalance', 0) <= resource.data.get('walletBalance', 0))
-          ||
-          // Receiving payment: caller may only increase SOMEONE ELSE's balance.
-          (userId != request.auth.uid
-            && request.resource.data.get('walletBalance', 0) >= resource.data.get('walletBalance', 0))
-        );
+      // The owner may delete their own profile (this is the in-app "Delete Account"
+      // button); admins may delete any.
+      allow delete: if isOwner(userId) || isAdmin();
 
       // Notifications: owner reads/updates. Any active (non-banned/paused) user
       // can create one in someone else's mailbox (needed for apply/offer/pay
       // flows), but must not be able to impersonate a different sender.
+      // Admins may also write into any mailbox (the panel's broadcast screen).
       match /notifications/{notifId} {
         allow read, update, delete: if isOwner(userId);
-        allow create: if isActiveUser()
+        allow create: if (isAdmin() || isActiveUser())
           && request.resource.data.get('fromUid', null) == request.auth.uid;
       }
 
@@ -140,8 +258,17 @@ service cloud.firestore {
 
     // ===== TASKS COLLECTION =====
     match /tasks/{taskId} {
-      // Any authenticated user can read tasks.
-      allow read: if isAuthenticated();
+      // Open tasks are the public marketplace. Once a task has been offered to
+      // or hired out to a helper it is private: only the poster and that helper
+      // (and admins) can read it. List queries must therefore be constrained to
+      // status == 'open' or to the caller's own uid (postedByUid / acceptedByUid /
+      // targetHelperUid) -- the app's queries are written that way.
+      allow read: if isAuthenticated()
+        && (resource.data.status == 'open'
+            || resource.data.postedByUid == request.auth.uid
+            || resource.data.get('acceptedByUid', '') == request.auth.uid
+            || resource.data.get('targetHelperUid', '') == request.auth.uid
+            || isAdmin());
 
       // Only active (not banned/paused) users with non-rejected ID can post tasks.
       allow create: if isActiveUser()
@@ -152,7 +279,8 @@ service cloud.firestore {
       // but ONLY through one of the specific, role-scoped transitions below.
       // Rejected users may still update (e.g. mark done on assigned tasks) but NOT create.
       // postedByUid is immutable after creation no matter which branch below matches.
-      allow update: if isActiveUser()
+      // Admins (the admin panel's force-close / expire) may change a task freely.
+      allow update: if isAdmin() || (isActiveUser()
         && request.resource.data.postedByUid == resource.data.postedByUid
         && (
           // A helper applies to an open task (adds themselves + their own bid only).
@@ -190,9 +318,11 @@ service cloud.firestore {
           || (isAssignedWorker()
               && taskKeysChangedOnly(['workerCompleted', 'workerCompletedAt']))
 
-          // Poster pays out and closes the task.
+          // Poster pays out and closes the task (amountPaidByPoster / discount* record
+          // what was actually charged when an admin discount applied).
           || (isTaskPoster()
-              && taskKeysChangedOnly(['status', 'completedAt', 'finalPricePaid', 'workerRating'])
+              && taskKeysChangedOnly(['status', 'completedAt', 'finalPricePaid', 'workerRating',
+                                      'amountPaidByPoster', 'discountPercent', 'discountAmount'])
               && request.resource.data.status == 'completed')
 
           // Anyone may flip a task to 'expired' (client-triggered cleanup), but
@@ -201,18 +331,35 @@ service cloud.firestore {
               && resource.data.status == 'open'
               && resource.data.endTime < request.time
               && request.resource.data.status == 'expired')
-        );
+        ));
 
       // Only the task poster or an admin can delete a task.
       allow delete: if (isActiveUser() && request.auth.uid == resource.data.postedByUid)
         || isAdmin();
 
-      // Task activity log
+      // Task activity log -- readable by whoever can read the task itself.
       match /taskLog/{logId} {
-        allow read: if isAuthenticated();
+        allow read: if isAuthenticated() && (canReadTask(taskId) || isAdmin());
         allow create: if isAuthenticated();
         allow update, delete: if false; // Logs are immutable
       }
+    }
+
+    // ===== REVIEWS COLLECTION =====
+    // One public review (rating + category only) per paid task. The task itself
+    // stays private; this is what shows under "Recent Reviews" on a profile.
+    match /reviews/{reviewId} {
+      allow read: if isAuthenticated();
+      allow create: if isActiveUser()
+        && reviewId == request.resource.data.taskId
+        && request.resource.data.posterUid == request.auth.uid
+        && request.resource.data.rating is number
+        && request.resource.data.rating >= 1
+        && request.resource.data.rating <= 5
+        && get(/databases/$(database)/documents/tasks/$(reviewId)).data.postedByUid == request.auth.uid
+        && get(/databases/$(database)/documents/tasks/$(reviewId)).data.get('acceptedByUid', '')
+             == request.resource.data.workerUid;
+      allow update, delete: if false;
     }
 
     // ===== CHATS COLLECTION =====
@@ -235,7 +382,28 @@ service cloud.firestore {
     // ===== WITHDRAWALS COLLECTION =====
     match /withdrawals/{withdrawalId} {
       allow read: if isAuthenticated() && (request.auth.uid == resource.data.uid || isAdmin());
-      allow create: if isActiveUser() && request.auth.uid == request.resource.data.uid;
+      // A withdrawal request holds the money: in the SAME batch the requester's REAL balance must
+      // go down by exactly the amount (checked with getAfter), so the same rupees can never
+      // be asked for twice. Rejecting refunds it (admin). Only open while Razorpay is on,
+      // i.e. when a wallet holds real earnings. Amount: whole rupees, 100 to 100000.
+      allow create: if isActiveUser() && request.auth.uid == request.resource.data.uid
+        && razorpayIsOn()
+        && request.resource.data.keys().hasOnly(['uid', 'amount', 'paymentDetails', 'userName', 'status', 'timestamp'])
+        && request.resource.data.keys().hasAll(['uid', 'amount', 'paymentDetails', 'status', 'timestamp'])
+        && request.resource.data.amount is int
+        && request.resource.data.amount >= 100
+        && request.resource.data.amount <= 100000
+        && request.resource.data.paymentDetails is string
+        && request.resource.data.paymentDetails.matches('^[A-Za-z0-9._-]{2,64}@[A-Za-z0-9]{2,32}$')
+        && request.resource.data.status == 'pending'
+        && request.resource.data.timestamp == request.time
+        && (!('userName' in request.resource.data)
+            || (request.resource.data.userName is string && request.resource.data.userName.size() <= 80))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('realBalance', 0)
+             >= request.resource.data.amount
+        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('realBalance', 0)
+             == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('realBalance', 0)
+                - request.resource.data.amount;
       allow update: if isAdmin();
       allow delete: if false;
     }
