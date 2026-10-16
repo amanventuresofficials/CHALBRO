@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <!--
     If you are serving your web app in a path other than the root, change the
@@ -16,7 +16,43 @@
   <meta charset="UTF-8">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="ChalBro - India's Human Marketplace. Post tasks, find local helpers, get things done.">
+
+  <!-- Search engines (SEO) -->
+  <title>ChalBro - India's Human Marketplace | Hire Local Helpers</title>
+  <meta name="description" content="ChalBro connects people who need help with local helpers who can do the task. Post a task, get offers from helpers nearby and hire the right person.">
+  <meta name="robots" content="index, follow">
+  <link rel="canonical" href="https://chalbro.in/">
+
+  <!-- Social sharing -->
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="ChalBro">
+  <meta property="og:title" content="ChalBro - India's Human Marketplace">
+  <meta property="og:description" content="Post a task and helpers nearby will apply. ChalBro connects people who need help with local people who can do the task.">
+  <meta property="og:url" content="https://chalbro.in/">
+  <meta property="og:image" content="https://chalbro.in/icons/Icon-512.png">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="ChalBro - India's Human Marketplace">
+  <meta name="twitter:description" content="Post a task and helpers nearby will apply. ChalBro connects people who need help with local people who can do the task.">
+  <meta name="twitter:image" content="https://chalbro.in/icons/Icon-512.png">
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "Organization",
+        "name": "ChalBro",
+        "url": "https://chalbro.in/",
+        "logo": "https://chalbro.in/icons/Icon-512.png"
+      },
+      {
+        "@type": "WebSite",
+        "name": "ChalBro",
+        "url": "https://chalbro.in/"
+      }
+    ]
+  }
+  </script>
 
   <!-- iOS meta tags & icons -->
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -27,7 +63,6 @@
   <!-- Favicon -->
   <link rel="icon" type="image/png" href="favicon.png"/>
 
-  <title>ChalBro - India's Human Marketplace</title>
   <link rel="manifest" href="manifest.json">
 
   <!-- Runtime config (edit config.js on the server; no rebuild needed) -->
@@ -42,6 +77,34 @@
   </script>
 </head>
 <body>
+  <!--
+    Plain-text version of the landing page for search engines and screen
+    readers. The app itself is drawn on a canvas, which has no readable text.
+    Kept off-screen (not display:none) so it stays in the page and does not
+    change the look of the app.
+  -->
+  <main id="seo-content" style="position:absolute;left:0;top:0;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap;">
+    <h1>ChalBro - India's Human Marketplace</h1>
+    <p>ChalBro connects people who need help with local people who can do the task. Post what you need done, helpers nearby apply, and you choose who to hire.</p>
+
+    <h2>How ChalBro works</h2>
+    <ol>
+      <li>Post a task: describe what you need, where it is and what you are willing to pay.</li>
+      <li>Get offers: helpers near you apply to your task, and you can look at their profiles and ratings.</li>
+      <li>Hire a helper: pick the person you like, or send a private request to one helper you already know.</li>
+      <li>Get it done and rate: once the task is finished you rate the helper, which helps the next person choose.</li>
+    </ol>
+
+    <h2>For helpers</h2>
+    <p>Switch on Open for Work, browse tasks near you, apply with your price and earn by helping people in your city.</p>
+
+    <h2>Everyday tasks</h2>
+    <p>Medicine pickup, document delivery, grocery shopping, furniture moving and many other errands and small jobs.</p>
+
+    <h2>Get started</h2>
+    <p>Sign in with your phone number or your Google account to post a task or start helping. ChalBro is available on the web and as an Android app.</p>
+  </main>
+
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>
