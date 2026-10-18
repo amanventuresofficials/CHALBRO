@@ -3,7 +3,8 @@
   "private": true,
   "description": "Tests firestore.rules against the Firestore emulator using the app's real queries and writes.",
   "scripts": {
-    "test": "firebase emulators:exec --only firestore --project demo-chalbro \"node rules.test.js\""
+    "test": "firebase emulators:exec --only firestore --project demo-chalbro \"node rules.test.js\"",
+    "test:storage": "firebase emulators:exec --only firestore,storage --project demo-chalbro \"node storage.test.js\""
   },
   "dependencies": {
     "@firebase/rules-unit-testing": "^5.0.0",

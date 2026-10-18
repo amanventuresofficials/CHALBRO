@@ -29,6 +29,40 @@ function computeAmounts(agreedAmount, discountPercent) {
   return { discountAmount, payable, commission, helperEarnings };
 }
 
+const round2 = (n) => Math.round(n * 100) / 100;
+
+/**
+ * The platform fee a helper owes when a task of [agreedAmount] was paid in cash
+ * directly (the 10% fee ChalBro would otherwise have kept). No discount applies.
+ */
+function cashFeeFor(agreedAmount) {
+  return round2(computeAmounts(agreedAmount, 0).commission);
+}
+
+/**
+ * Splits a helper's [helperEarnings] from an online payment between settling the fees
+ * they still owe from cash jobs ([feeDue]) and what lands in their earnings. Fees are
+ * taken payment after payment until nothing is owed.
+ * Returns { recovered, credit }.
+ */
+function splitRecovery(helperEarnings, feeDue) {
+  const owed = Number.isFinite(Number(feeDue)) && Number(feeDue) > 0 ? Number(feeDue) : 0;
+  const recovered = round2(Math.min(owed, Math.max(helperEarnings, 0)));
+  return { recovered, credit: round2(helperEarnings - recovered) };
+}
+
+// Same limits as the app's withdrawal rules (lib/utils/withdrawal.dart, firestore.rules).
+const MIN_PAYOUT = 100;
+const MAX_PAYOUT = 100000;
+const UPI_PATTERN = /^[A-Za-z0-9._-]{2,64}@[A-Za-z0-9]{2,32}$/;
+
+/** Whole rupees to send straight to a helper's UPI id from [balance], or 0 to keep waiting. */
+function autoPayoutAmount(balance) {
+  const whole = Math.floor(Number(balance));
+  if (!Number.isFinite(whole) || whole < MIN_PAYOUT) return 0;
+  return Math.min(whole, MAX_PAYOUT);
+}
+
 /** Ratings come from the client, so never trust them: whole numbers 1..5 only. */
 function clampRating(value) {
   const n = Number(value);
@@ -42,4 +76,11 @@ module.exports = {
   resolveDiscountPercent,
   computeAmounts,
   clampRating,
+  round2,
+  cashFeeFor,
+  splitRecovery,
+  MIN_PAYOUT,
+  MAX_PAYOUT,
+  UPI_PATTERN,
+  autoPayoutAmount,
 };

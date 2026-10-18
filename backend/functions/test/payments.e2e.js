@@ -114,8 +114,8 @@ function paidPayment(orderId, paymentId, status = "captured") {
 
 // ─── Scenarios ──────────────────────────────────────────────────────────────
 async function main() {
-  await db.collection("users").doc(WORKER).set({ walletBalance: 500, realBalance: 0, ratingSum: 0, ratingCount: 0, tasksDone: 0 });
-  await db.collection("users").doc(POSTER).set({ walletBalance: 500 });
+  await db.collection("users").doc(WORKER).set({ ratingSum: 0, ratingCount: 0, tasksDone: 0 });
+  await db.collection("users").doc(POSTER).set({ fullName: "Poster" });
 
   console.log("Normal payments (must keep working, must not log anything)");
 
@@ -127,6 +127,14 @@ async function main() {
     assert.equal(r.discountAmount, 0);
     assert.match(r.orderId, /^order_E2E/);
     assert.equal((await logs()).length, 0);
+  });
+
+  await check("the answer sent to the app holds the public key id but never the secret", async () => {
+    await seedTask("t_noleak");
+    const r = await create("t_noleak");
+    assert.deepEqual(Object.keys(r).sort(), ["agreedAmount", "amount", "currency", "discountAmount", "keyId", "orderId"]);
+    assert.equal(r.keyId, "rzp_test_standin");
+    assert.ok(!JSON.stringify(r).includes(process.env.RAZORPAY_KEY_SECRET), "the secret must never be in an answer");
   });
 
   await check("verifyRazorpayPayment completes the task and pays the helper 90%", async () => {
@@ -141,11 +149,13 @@ async function main() {
     assert.equal(task.paidViaRazorpay, true);
     assert.equal(task.workerRating, 4);
     const worker = (await db.collection("users").doc(WORKER).get()).data();
-    assert.equal(worker.realBalance, 270, "real money goes to the REAL balance");
-    assert.equal(worker.walletBalance, 500, "the practice wallet is untouched by a Razorpay payment");
+    assert.equal(worker.earnings, 270, "the helper's earnings go up by 90% of the price");
     assert.equal(worker.tasksDone, 1);
+    assert.deepEqual(Object.keys(worker).sort(), ["earnings", "ratingCount", "ratingSum", "tasksDone"], "only these numbers change");
     const txs = (await db.collection("users").doc(WORKER).collection("transactions").get()).docs.map((d) => d.data());
-    assert.ok(txs.length === 1 && txs[0].real === true && txs[0].type === "credit", "the credit is tagged as real money");
+    assert.ok(txs.length === 1 && txs[0].razorpay === true && txs[0].type === "credit", "the credit is tagged as a Razorpay entry");
+    const notes = (await db.collection("users").doc(WORKER).collection("notifications").get()).docs.map((d) => d.data());
+    assert.ok(notes.length === 1 && notes[0].type === "payment_received" && notes[0].fromUid === POSTER && /270/.test(notes[0].message), "the helper is told");
     // The owner's revenue = paid - helper earnings = 30
     assert.equal(task.amountPaidByPoster - 270, 30);
     assert.equal((await logs()).length, 0);
@@ -155,7 +165,7 @@ async function main() {
     const orderId = Object.keys(rz.orders)[0];
     const r = await verify({ taskId: "t_happy", givenRating: 4, razorpayOrderId: orderId, razorpayPaymentId: "pay_E2E000001", razorpaySignature: sign(orderId, "pay_E2E000001") });
     assert.deepEqual(r, { success: true, alreadyCompleted: true });
-    assert.equal((await db.collection("users").doc(WORKER).get()).data().realBalance, 270);
+    assert.equal((await db.collection("users").doc(WORKER).get()).data().earnings, 270);
     assert.equal((await logs()).length, 0);
   });
 

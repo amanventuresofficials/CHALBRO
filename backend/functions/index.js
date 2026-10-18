@@ -2,9 +2,31 @@ const functions = require("firebase-functions");
 const admin = require("firebase-admin");
 const crypto = require("crypto");
 const Razorpay = require("razorpay");
-const { resolveDiscountPercent, computeAmounts, clampRating } = require("./payments");
+const {
+  resolveDiscountPercent,
+  computeAmounts,
+  clampRating,
+  cashFeeFor,
+  splitRecovery,
+  autoPayoutAmount,
+  UPI_PATTERN,
+} = require("./payments");
 const { buildErrorDoc, makeLimiter } = require("./errorlog");
+const payouts = require("./payouts");
 admin.initializeApp();
+
+// The modular import: `admin.firestore.FieldValue` is missing under the Functions
+// emulator, which wraps the firebase-admin namespace.
+const { FieldValue } = require("firebase-admin/firestore");
+
+// The two values that must never leak live in Google Secret Manager, NOT in `.env`, the code or the
+// deployed bundle. Naming them here makes Firebase hand each one, as an ordinary environment variable,
+// ONLY to the functions that need it:
+//   firebase functions:secrets:set RAZORPAY_KEY_SECRET        (you type it; nobody else sees it)
+//   firebase functions:secrets:set RAZORPAYX_WEBHOOK_SECRET   (any long random text)
+// `.env` keeps only the harmless ids (RAZORPAY_KEY_ID, RAZORPAYX_ACCOUNT_NUMBER).
+const PAYMENT_SECRETS = ["RAZORPAY_KEY_SECRET"];
+const WEBHOOK_SECRETS = ["RAZORPAYX_WEBHOOK_SECRET"];
 
 function getRazorpayClient() {
   return new Razorpay({
@@ -30,7 +52,7 @@ async function logServerError(fnName, err, data, context, category = "payment") 
     if (!doc || !errorLimiter.allow(doc.fingerprint)) return;
     const write = admin.firestore().collection("errorLogs").add({
       ...doc,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: FieldValue.serverTimestamp(),
     });
     await Promise.race([write, new Promise((resolve) => setTimeout(resolve, 3000))]);
   } catch (loggingError) {
@@ -51,16 +73,56 @@ function withErrorLog(fnName, handler) {
   };
 }
 
+// metadata/paymentConfig: useRazorpay, discountEnabled/Percent, autoPayout.
+async function readPaymentConfig() {
+  const snap = await admin.firestore().collection("metadata").doc("paymentConfig").get();
+  return snap.exists ? snap.data() || {} : {};
+}
+
 // Reads the admin-controlled discount from metadata/paymentConfig.
 async function getDiscountPercent() {
-  const snap = await admin.firestore().collection("metadata").doc("paymentConfig").get();
-  return resolveDiscountPercent(snap.exists ? snap.data() : null);
+  return resolveDiscountPercent(await readPaymentConfig());
 }
+
+// What the poster and the hired helper agreed for the task (rupees).
+function agreedAmountOf(task) {
+  return task.bids && task.bids[task.acceptedByUid]
+    ? Number(task.bids[task.acceptedByUid])
+    : Number(task.proposedPrice || task.price);
+}
+
+function taskLog(taskId, action, actorUid, details) {
+  return admin
+    .firestore()
+    .collection("tasks")
+    .doc(taskId)
+    .collection("taskLog")
+    .add({ action, actorUid, details, timestamp: FieldValue.serverTimestamp() });
+}
+
+function notification(uid, fromUid, { title, message, type, taskId }) {
+  return admin
+    .firestore()
+    .collection("users")
+    .doc(uid)
+    .collection("notifications")
+    .add({
+      fromUid,
+      taskId: taskId || "",
+      title,
+      message,
+      type,
+      isRead: false,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+}
+
+const rupees = (n) => `₹${Math.round(n * 100) % 100 === 0 ? Math.round(n) : n.toFixed(2)}`;
 
 // Creates a Razorpay order for a hired task. The amount is worked out here from
 // the task document and the admin's discount setting -- the client can never
 // dictate what is charged.
-exports.createRazorpayOrder = functions.https.onCall(withErrorLog("createRazorpayOrder", async (data, context) => {
+exports.createRazorpayOrder = functions.runWith({ secrets: PAYMENT_SECRETS }).https.onCall(withErrorLog("createRazorpayOrder", async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError("unauthenticated", "You must be signed in.");
   }
@@ -85,9 +147,7 @@ exports.createRazorpayOrder = functions.https.onCall(withErrorLog("createRazorpa
     throw new functions.https.HttpsError("failed-precondition", "Hire a helper before paying for this task.");
   }
 
-  const agreedAmount = task.bids && task.bids[task.acceptedByUid]
-    ? Number(task.bids[task.acceptedByUid])
-    : Number(task.proposedPrice || task.price);
+  const agreedAmount = agreedAmountOf(task);
   if (!Number.isFinite(agreedAmount) || agreedAmount <= 0) {
     throw new functions.https.HttpsError("failed-precondition", "Task has no valid price.");
   }
@@ -124,9 +184,16 @@ exports.createRazorpayOrder = functions.https.onCall(withErrorLog("createRazorpa
 }));
 
 // Confirms a Razorpay payment really happened -- for THIS task, for the amount
-// the server asked for -- then completes the task and credits the helper.
-// The poster's in-app wallet is NOT debited: they paid real money instead.
-exports.verifyRazorpayPayment = functions.https.onCall(withErrorLog("verifyRazorpayPayment", async (data, context) => {
+// the server asked for -- then completes the task, credits the helper's earnings
+// and tells them. Only this function can complete a task while Razorpay is on
+// (the Firestore rules refuse the app's own attempt).
+//
+// Two more things happen here:
+//  * Fees the helper still owes from earlier CASH jobs (`feeDue`) are taken out of
+//    this payment, payment after payment, until nothing is owed.
+//  * If the owner has switched on direct UPI payouts and the helper has linked a UPI
+//    id, the balance is moved into a withdrawal that autoPayWithdrawal then sends.
+exports.verifyRazorpayPayment = functions.runWith({ secrets: PAYMENT_SECRETS }).https.onCall(withErrorLog("verifyRazorpayPayment", async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError("unauthenticated", "You must be signed in.");
   }
@@ -196,65 +263,428 @@ exports.verifyRazorpayPayment = functions.https.onCall(withErrorLog("verifyRazor
   const workerUid = task.acceptedByUid;
   const rating = clampRating(givenRating);
 
+  const cfg = await readPaymentConfig();
+  const directPayouts = cfg.autoPayout === true && payouts.payoutsConfigured();
+
   const db = admin.firestore();
-  const batch = db.batch();
-
-  batch.set(taskRef, {
-    status: "completed",
-    completedAt: admin.firestore.FieldValue.serverTimestamp(),
-    finalPricePaid: agreedAmount,
-    amountPaidByPoster: payable,
-    discountPercent,
-    discountAmount,
-    workerRating: rating,
-    paidViaRazorpay: true,
-    razorpayPaymentId,
-  }, { merge: true });
-
-  batch.set(db.collection("users").doc(context.auth.uid).collection("transactions").doc(), {
-    amount: payable,
-    type: "debit",
-    title: discountAmount > 0
-      ? `Paid for task via Razorpay (₹${discountAmount} discount applied)`
-      : "Paid for task (Razorpay)",
-    taskId,
-    razorpayPaymentId,
-    real: true, // shown in the app's real-money wallet history, not the practice one
-    timestamp: admin.firestore.FieldValue.serverTimestamp(),
-  });
-
   const workerRef = db.collection("users").doc(workerUid);
-  // Real money earned goes to the helper's REAL balance. The practice wallet
-  // (walletBalance, test credit) is never touched by a Razorpay payment.
-  batch.set(workerRef, {
-    realBalance: admin.firestore.FieldValue.increment(helperEarnings),
-    ratingSum: admin.firestore.FieldValue.increment(rating),
-    ratingCount: admin.firestore.FieldValue.increment(1),
-    tasksDone: admin.firestore.FieldValue.increment(1),
-  }, { merge: true });
+  const now = FieldValue.serverTimestamp();
 
-  batch.set(workerRef.collection("transactions").doc(), {
-    amount: helperEarnings,
-    type: "credit",
-    title: "Earned from task (Razorpay payment)",
-    taskId,
-    real: true,
-    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+  // One transaction: the helper's owed fees and balance are read and changed together, so
+  // two payments at the same moment cannot both take the same fee or pay out the same money.
+  const outcome = await db.runTransaction(async (tx) => {
+    const [freshTask, workerSnap] = await Promise.all([tx.get(taskRef), tx.get(workerRef)]);
+    if (freshTask.data().status === "completed") return { alreadyCompleted: true };
+
+    const w = workerSnap.exists ? workerSnap.data() || {} : {};
+    const { recovered, credit } = splitRecovery(helperEarnings, w.feeDue);
+    const before = Number(w.earnings) > 0 ? Number(w.earnings) : 0;
+    const upi = typeof w.upiId === "string" && UPI_PATTERN.test(w.upiId) ? w.upiId : "";
+    const payout = directPayouts && upi ? autoPayoutAmount(before + credit) : 0;
+
+    tx.set(taskRef, {
+      status: "completed",
+      completedAt: now,
+      finalPricePaid: agreedAmount,
+      amountPaidByPoster: payable,
+      discountPercent,
+      discountAmount,
+      workerRating: rating,
+      paidViaRazorpay: true,
+      razorpayPaymentId,
+      ...(recovered > 0 ? { feeRecovered: recovered } : {}),
+    }, { merge: true });
+
+    tx.set(db.collection("users").doc(context.auth.uid).collection("transactions").doc(), {
+      amount: payable,
+      type: "debit",
+      title: discountAmount > 0
+        ? `Paid for task via Razorpay (₹${discountAmount} discount applied)`
+        : "Paid for task (Razorpay)",
+      taskId,
+      razorpayPaymentId,
+      razorpay: true, // part of the earnings history the app lists
+      timestamp: now,
+    });
+
+    // What the helper earned is added to their withdrawable earnings.
+    const workerUpdate = {
+      earnings: FieldValue.increment(credit - payout),
+      ratingSum: FieldValue.increment(rating),
+      ratingCount: FieldValue.increment(1),
+      tasksDone: FieldValue.increment(1),
+    };
+    if (recovered > 0) workerUpdate.feeDue = FieldValue.increment(-recovered);
+    tx.set(workerRef, workerUpdate, { merge: true });
+
+    tx.set(workerRef.collection("transactions").doc(), {
+      amount: helperEarnings,
+      type: "credit",
+      title: "Earned from task (Razorpay payment)",
+      taskId,
+      razorpay: true,
+      timestamp: now,
+    });
+    if (recovered > 0) {
+      tx.set(workerRef.collection("transactions").doc(), {
+        amount: recovered,
+        type: "debit",
+        title: "Platform fee for earlier cash job(s)",
+        taskId,
+        razorpay: true,
+        timestamp: now,
+      });
+    }
+    if (payout > 0) {
+      const withdrawalRef = db.collection("withdrawals").doc();
+      tx.set(withdrawalRef, {
+        uid: workerUid,
+        userName: String(w.fullName || ""),
+        amount: payout,
+        paymentDetails: upi,
+        status: "pending",
+        auto: true,
+        taskId,
+        timestamp: now,
+      });
+      tx.set(workerRef.collection("transactions").doc(), {
+        amount: payout,
+        type: "debit",
+        title: `Sent to your UPI (${upi})`,
+        withdrawalId: withdrawalRef.id,
+        razorpay: true,
+        timestamp: now,
+      });
+    }
+
+    // Tell the helper (also becomes a push through sendPushNotification).
+    const taken = recovered > 0 ? ` (${rupees(recovered)} was kept for the platform fee on earlier cash jobs)` : "";
+    tx.set(workerRef.collection("notifications").doc(), {
+      fromUid: context.auth.uid,
+      taskId,
+      title: "💰 Payment received!",
+      message: `You earned ${rupees(helperEarnings)} for your work${taken}. Great job!`,
+      createdAt: now,
+      isRead: false,
+      type: "payment_received",
+    });
+
+    // Public review (rating + category only) -- the task itself stays private.
+    tx.set(db.collection("reviews").doc(taskId), {
+      taskId,
+      workerUid,
+      posterUid: context.auth.uid,
+      rating,
+      category: task.category || "Task",
+      createdAt: now,
+    });
+    return { alreadyCompleted: false };
   });
 
-  // Public review (rating + category only) -- the task itself stays private.
-  batch.set(db.collection("reviews").doc(taskId), {
-    taskId,
-    workerUid,
-    posterUid: context.auth.uid,
-    rating,
-    category: task.category || "Task",
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-  });
-
-  await batch.commit();
+  if (outcome.alreadyCompleted) return { success: true, alreadyCompleted: true };
   return { success: true };
 }));
+
+// ─── Cash payments ──────────────────────────────────────────────────────────────
+// Poster and helper may settle a job in cash, outside the app. ChalBro's 10% fee is then
+// owed by the helper (`feeDue` on their user document) and is taken out of their next
+// online payments (see verifyRazorpayPayment) until it is settled.
+//
+// Two steps so a poster cannot put a fee on a helper alone:
+//   claimCashPayment   the poster says they paid cash (and gives the rating)
+//   answerCashPayment  the helper confirms they received it (or says they did not)
+
+exports.claimCashPayment = functions.https.onCall(withErrorLog("claimCashPayment", async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "You must be signed in.");
+  }
+  const taskId = data.taskId;
+  if (!taskId) {
+    throw new functions.https.HttpsError("invalid-argument", "taskId is required.");
+  }
+  const taskRef = admin.firestore().collection("tasks").doc(taskId);
+  const snap = await taskRef.get();
+  if (!snap.exists) {
+    throw new functions.https.HttpsError("not-found", "Task not found.");
+  }
+  const task = snap.data();
+  if (task.postedByUid !== context.auth.uid) {
+    throw new functions.https.HttpsError("permission-denied", "Only the person who posted this task can say it was paid in cash.");
+  }
+  if (task.status === "completed") {
+    throw new functions.https.HttpsError("failed-precondition", "This task is already completed.");
+  }
+  if (task.status !== "assigned" || !task.acceptedByUid) {
+    throw new functions.https.HttpsError("failed-precondition", "Hire a helper before closing this task.");
+  }
+  if ((await readPaymentConfig()).useRazorpay !== true) {
+    throw new functions.https.HttpsError("failed-precondition", "Payments are switched off, so there is nothing to pay for this task.");
+  }
+  const agreed = agreedAmountOf(task);
+  if (!Number.isFinite(agreed) || agreed <= 0) {
+    throw new functions.https.HttpsError("failed-precondition", "Task has no valid price.");
+  }
+
+  await taskRef.update({
+    cashClaimedAt: FieldValue.serverTimestamp(),
+    cashClaimRating: clampRating(data.givenRating),
+  });
+  const fee = cashFeeFor(agreed);
+  await taskLog(taskId, "cash_claimed", context.auth.uid, `Poster says ${rupees(agreed)} was paid in cash. Waiting for the helper to confirm.`);
+  await notification(task.acceptedByUid, context.auth.uid, {
+    title: "Cash payment?",
+    message: `The poster says they paid you ${rupees(agreed)} in cash for "${task.title || "your task"}". `
+      + `Please confirm in the task. ChalBro's fee (${rupees(fee)}) is then taken from your next online payments.`,
+    type: "cash_claim",
+    taskId,
+  });
+  return { success: true, fee };
+}));
+
+exports.answerCashPayment = functions.https.onCall(withErrorLog("answerCashPayment", async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "You must be signed in.");
+  }
+  const taskId = data.taskId;
+  if (!taskId || typeof data.received !== "boolean") {
+    throw new functions.https.HttpsError("invalid-argument", "taskId and received are required.");
+  }
+  const db = admin.firestore();
+  const taskRef = db.collection("tasks").doc(taskId);
+  const snap = await taskRef.get();
+  if (!snap.exists) {
+    throw new functions.https.HttpsError("not-found", "Task not found.");
+  }
+  const task = snap.data();
+  if (task.acceptedByUid !== context.auth.uid) {
+    throw new functions.https.HttpsError("permission-denied", "Only the hired helper can answer this.");
+  }
+  if (task.status === "completed") {
+    return { success: true, alreadyCompleted: true };
+  }
+  if (task.status !== "assigned" || !task.cashClaimedAt) {
+    throw new functions.https.HttpsError("failed-precondition", "No cash payment has been reported for this task.");
+  }
+
+  const posterUid = task.postedByUid;
+  const title = task.title || "the task";
+
+  if (!data.received) {
+    await taskRef.update({ cashClaimedAt: FieldValue.delete(), cashClaimRating: FieldValue.delete() });
+    await taskLog(taskId, "cash_denied", context.auth.uid, "Helper says the cash payment was not received.");
+    await notification(posterUid, context.auth.uid, {
+      title: "Cash payment not confirmed",
+      message: `The helper says they have not received cash for "${title}". You can pay online instead.`,
+      type: "cash_denied",
+      taskId,
+    });
+    return { success: true, confirmed: false };
+  }
+
+  const agreed = agreedAmountOf(task);
+  if (!Number.isFinite(agreed) || agreed <= 0) {
+    throw new functions.https.HttpsError("failed-precondition", "Task has no valid price.");
+  }
+  const fee = cashFeeFor(agreed);
+  const rating = clampRating(task.cashClaimRating);
+  const workerRef = db.collection("users").doc(context.auth.uid);
+  const now = FieldValue.serverTimestamp();
+
+  const done = await db.runTransaction(async (tx) => {
+    const fresh = await tx.get(taskRef);
+    if (fresh.data().status === "completed") return false;
+    tx.update(taskRef, {
+      status: "completed",
+      completedAt: now,
+      workerRating: rating,
+      paidInCash: true,
+      cashAmount: agreed,
+      cashFee: fee,
+      cashClaimedAt: FieldValue.delete(),
+      cashClaimRating: FieldValue.delete(),
+    });
+    tx.set(db.collection("reviews").doc(taskId), {
+      taskId,
+      workerUid: context.auth.uid,
+      posterUid,
+      rating,
+      category: task.category || "Task",
+      createdAt: now,
+    });
+    tx.set(workerRef, {
+      feeDue: FieldValue.increment(fee),
+      ratingSum: FieldValue.increment(rating),
+      ratingCount: FieldValue.increment(1),
+      tasksDone: FieldValue.increment(1),
+    }, { merge: true });
+    return true;
+  });
+  if (!done) return { success: true, alreadyCompleted: true };
+
+  await taskLog(taskId, "cash_confirmed", context.auth.uid,
+    `Helper confirmed ${rupees(agreed)} paid in cash. Platform fee ${rupees(fee)} will be taken from their next online payments.`);
+  await notification(posterUid, context.auth.uid, {
+    title: "✅ Task completed",
+    message: `The helper confirmed the cash payment for "${title}".`,
+    type: "task_completed",
+    taskId,
+  });
+  return { success: true, confirmed: true, fee };
+}));
+
+// ─── Paying helpers straight to their UPI id (RazorpayX) ───────────────────────
+
+// The server-only record of RazorpayX contacts / fund accounts (no app can read or write it).
+const payoutStore = {
+  get: async (uid) => {
+    const s = await admin.firestore().collection("payoutAccounts").doc(uid).get();
+    return s.exists ? s.data() : null;
+  },
+  set: (uid, data) => admin.firestore().collection("payoutAccounts").doc(uid).set(data, { merge: true }),
+};
+
+// The final answer for a withdrawal that was sent for automatic payout.
+//   'paid'   -> approved (+ reference), the helper is told
+//   'failed' -> rejected, the money goes back into their earnings, the helper is told
+// Safe to call twice: a withdrawal that is already final is left alone (a payout that was
+// 'processed' and later REVERSED by the bank is the one exception, and only for auto payouts).
+async function settlePayout(withdrawalId, outcome, info = {}) {
+  const db = admin.firestore();
+  const ref = db.collection("withdrawals").doc(withdrawalId);
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (!snap.exists) return "missing";
+    const w = snap.data();
+    const final = w.status === "approved" || w.status === "rejected";
+    if (final && !(outcome === "failed" && w.status === "approved" && w.auto === true)) return "already";
+
+    const userRef = db.collection("users").doc(w.uid);
+    const now = FieldValue.serverTimestamp();
+    if (outcome === "paid") {
+      tx.update(ref, {
+        status: "approved",
+        processedAt: now,
+        paidReference: info.utr || info.payoutId || "",
+        ...(info.payoutId ? { payoutId: info.payoutId } : {}),
+      });
+      tx.set(userRef.collection("notifications").doc(), {
+        fromUid: "chalbro",
+        title: "Withdrawal paid",
+        message: `We have sent ₹${w.amount} to ${w.paymentDetails}.`,
+        type: "withdrawal",
+        isRead: false,
+        createdAt: now,
+      });
+      return "paid";
+    }
+    tx.update(ref, {
+      status: "rejected",
+      processedAt: now,
+      failureReason: String(info.reason || "The payment could not be completed.").slice(0, 200),
+    });
+    tx.set(userRef, { earnings: FieldValue.increment(w.amount) }, { merge: true });
+    tx.set(userRef.collection("transactions").doc(), {
+      amount: w.amount,
+      type: "credit",
+      title: "Withdrawal not paid - returned",
+      withdrawalId,
+      razorpay: true,
+      timestamp: now,
+    });
+    tx.set(userRef.collection("notifications").doc(), {
+      fromUid: "chalbro",
+      title: "Withdrawal not paid",
+      message: `We could not pay your ₹${w.amount} withdrawal. The money is back in your earnings.`,
+      type: "withdrawal",
+      isRead: false,
+      createdAt: now,
+    });
+    return "failed";
+  });
+}
+
+// A new withdrawal (typed by the helper, or made by verifyRazorpayPayment for a linked UPI id)
+// is paid out automatically when the owner has switched that on. Otherwise nothing happens and
+// the owner pays it by hand from the admin panel, as before.
+exports.autoPayWithdrawal = functions
+  .runWith({ secrets: PAYMENT_SECRETS })
+  .firestore
+  .document("withdrawals/{withdrawalId}")
+  .onCreate(async (snap, context) => {
+    const id = context.params.withdrawalId;
+    const w = snap.data() || {};
+    try {
+      if (w.status !== "pending") return null;
+      if ((await readPaymentConfig()).autoPayout !== true || !payouts.payoutsConfigured()) return null;
+      if (!UPI_PATTERN.test(String(w.paymentDetails || "")) || !(Number(w.amount) > 0)) return null;
+
+      // Claim it first, so a person cannot also pay it by hand while it is being sent.
+      const db = admin.firestore();
+      const claimed = await db.runTransaction(async (tx) => {
+        const cur = await tx.get(snap.ref);
+        if (!cur.exists || cur.data().status !== "pending") return false;
+        tx.update(snap.ref, { status: "processing", processingAt: FieldValue.serverTimestamp(), auto: true });
+        return true;
+      });
+      if (!claimed) return null;
+
+      try {
+        const res = await payouts.payToUpi({
+          store: payoutStore,
+          uid: w.uid,
+          name: w.userName,
+          vpa: w.paymentDetails,
+          amountRupees: Number(w.amount),
+          reference: id,
+          narration: "ChalBro payout",
+        });
+        await snap.ref.update({ payoutId: res.id, payoutStatus: res.status });
+        if (res.status === "processed") {
+          await settlePayout(id, "paid", { payoutId: res.id, utr: res.utr });
+        } else if (["rejected", "cancelled", "reversed", "failed"].includes(res.status)) {
+          await settlePayout(id, "failed", { payoutId: res.id, reason: `The payout was ${res.status}.` });
+        }
+        // anything else (queued / pending / processing): the webhook gives the final answer
+      } catch (err) {
+        const answered = typeof err.statusCode === "number";
+        await snap.ref.update(answered
+          // RazorpayX answered with an error: nothing was sent. Back to a person.
+          ? { status: "pending", processingAt: FieldValue.delete(), autoError: String(err.message).slice(0, 200) }
+          // No answer at all (network): we cannot know. Keep it locked and say so.
+          : { autoError: `Could not confirm the payout: ${String(err.message).slice(0, 160)}. Check RazorpayX before paying by hand.` });
+        await logServerError("autoPayWithdrawal", err, { taskId: w.taskId }, null);
+      }
+    } catch (outer) {
+      await logServerError("autoPayWithdrawal", outer, { taskId: w.taskId }, null);
+    }
+    return null;
+  });
+
+// RazorpayX tells us how a payout ended. Register this function's URL in the RazorpayX
+// dashboard (Settings > Webhooks) with the events payout.processed, payout.reversed,
+// payout.rejected, payout.failed and payout.cancelled, and put the secret you choose there
+// into RAZORPAYX_WEBHOOK_SECRET.
+exports.razorpayXWebhook = functions.runWith({ secrets: WEBHOOK_SECRETS }).https.onRequest(async (req, res) => {
+  if (req.method !== "POST") {
+    res.status(405).send("POST only");
+    return;
+  }
+  const ok = payouts.webhookSignatureOk(req.rawBody, req.get("X-Razorpay-Signature"), process.env.RAZORPAYX_WEBHOOK_SECRET);
+  if (!ok) {
+    res.status(400).send("bad signature");
+    return;
+  }
+  try {
+    const event = payouts.readPayoutEvent(req.body);
+    if (event.outcome !== "ignore" && event.reference) {
+      await settlePayout(event.reference, event.outcome === "paid" ? "paid" : "failed", event);
+    }
+    res.status(200).send("ok");
+  } catch (err) {
+    await logServerError("razorpayXWebhook", err, null, null);
+    res.status(500).send("error"); // Razorpay retries
+  }
+});
 
 exports.sendPushNotification = functions.firestore
   .document("users/{userId}/notifications/{notificationId}")

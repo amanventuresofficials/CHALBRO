@@ -2,33 +2,43 @@ rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
 
+    // Only real photo types are accepted (no SVG: a vector image can carry script and is
+    // served from a Google domain that people trust).
+    function isPhoto() {
+      return request.resource.contentType.matches('image/(jpeg|jpg|png|webp|heic|heif|gif)');
+    }
+
     // Profile photos: authenticated users can read any, but only write their own (.jpg)
     match /profile_photos/{fileName} {
       allow read: if request.auth != null;
       allow write: if request.auth != null
                    && fileName == request.auth.uid + '.jpg'
                    && request.resource.size < 5 * 1024 * 1024
-                   && request.resource.contentType.matches('image/.*');
+                   && isPhoto();
     }
 
     // ID proofs: owner can upload and read. Admins can also read.
     match /id_proofs/{fileName} {
       allow read: if request.auth != null && (
-                    fileName.matches(request.auth.uid + '\\..+') || 
+                    fileName.matches(request.auth.uid + '\\..+') ||
                     firestore.exists(/databases/(default)/documents/admins/$(request.auth.uid))
                   );
       allow write: if request.auth != null
                    && fileName.matches(request.auth.uid + '\\..+')
                    && request.resource.size < 10 * 1024 * 1024
-                   && request.resource.contentType.matches('image/.*');
+                   && isPhoto();
     }
 
-    // Task images: authenticated users can upload and read
+    // Task images: the app names each file "<millis>_<uid>.jpg". A signed-in user can add a
+    // file under their OWN uid, once -- nobody can replace or delete another person's picture.
     match /task_images/{imageId} {
       allow read: if request.auth != null;
-      allow write: if request.auth != null
-                   && request.resource.size < 10 * 1024 * 1024
-                   && request.resource.contentType.matches('image/.*');
+      allow create: if request.auth != null
+                    && resource == null
+                    && imageId.matches('[0-9]+_' + request.auth.uid + '\\.jpg')
+                    && request.resource.size < 10 * 1024 * 1024
+                    && isPhoto();
+      allow update, delete: if false;
     }
   }
 }

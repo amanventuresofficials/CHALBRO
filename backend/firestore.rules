@@ -74,8 +74,9 @@ service cloud.firestore {
     //  - moderation flags (isBanned, isPaused, canPost) -- admin only;
     //  - idProofStatus, except to submit for review ('Pending Verification') or to
     //    record that no ID has been uploaded yet -- never to approve themselves;
-    //  - walletBalance / ratingSum / ratingCount / tasksDone, except to be given
-    //    their standard starting values once, when the profile is first saved.
+    //  - earnings / feeDue / ratingSum / ratingCount / tasksDone, except to be given their
+    //    standard starting values once, when the profile is first saved;
+    //  - upiId, except to a well-formed UPI id (or to remove it): it is where payouts go.
     function isOwnerProfileEdit(userId) {
       return isOwner(userId)
         && !changedUserKeys().hasAny(['isBanned', 'isPaused', 'canPost'])
@@ -83,52 +84,80 @@ service cloud.firestore {
             || request.resource.data.idProofStatus == 'Pending Verification'
             || (!('idProofStatus' in resource.data)
                 && request.resource.data.idProofStatus == 'Not Uploaded'))
-        && (!changedUserKeys().hasAny(['walletBalance', 'realBalance', 'ratingSum', 'ratingCount', 'tasksDone'])
-            || startsWithStandardEconomy());
+        && (!changedUserKeys().hasAny(['earnings', 'feeDue', 'ratingSum', 'ratingCount', 'tasksDone'])
+            || startsWithStandardEconomy())
+        && (!changedUserKeys().hasAny(['upiId']) || isValidUpiOrAbsent());
     }
 
-    // Two separate balances live on the user document:
-    //   walletBalance = practice (test) credit, Rs 500 to start. Used while Razorpay is OFF.
-    //   realBalance   = real money earned through Razorpay payments, 0 to start. Only the
-    //                   payment Cloud Function (Admin SDK) and admins can ever raise it; the
-    //                   owner can only lower it, by withdrawing (see /withdrawals).
-    // True once the owner has switched Razorpay on (real money, so withdrawals are open).
+    // The linked payout UPI id on the document being written: absent (removed) or name@bank.
+    function isValidUpiOrAbsent() {
+      return !('upiId' in request.resource.data)
+        || (request.resource.data.upiId is string
+            && request.resource.data.upiId.matches('^[A-Za-z0-9._-]{2,64}@[A-Za-z0-9]{2,32}$'));
+    }
+
+    // True once the owner has switched Razorpay on. While it is on, a task can only be
+    // completed (and its review and the helper's rating written) by the payment Cloud
+    // Function after a confirmed payment. While it is off no payment is taken, so the
+    // poster closes the task and rates the helper themselves.
     function razorpayIsOn() {
       return exists(/databases/$(database)/documents/metadata/paymentConfig)
         && get(/databases/$(database)/documents/metadata/paymentConfig).data.get('useRazorpay', false) == true;
     }
 
+    // `earnings` is what ChalBro owes a helper for tasks paid through Razorpay. Only the
+    // payment Cloud Function (Admin SDK) and admins can ever raise it; the owner can only
+    // lower it, by withdrawing (see /withdrawals). `feeDue` is the platform fee a helper
+    // still owes from jobs paid in cash; only the Cloud Functions and admins touch it.
     function startsWithStandardEconomy() {
-      return !('walletBalance' in resource.data)
-        && !('realBalance' in resource.data)
-        && request.resource.data.get('walletBalance', 500) == 500
-        && request.resource.data.get('realBalance', 0) == 0
+      return !('earnings' in resource.data)
+        && !('feeDue' in resource.data)
+        && request.resource.data.get('earnings', 0) == 0
+        && request.resource.data.get('feeDue', 0) == 0
         && request.resource.data.get('ratingSum', 0) == 0
         && request.resource.data.get('ratingCount', 0) == 0
         && request.resource.data.get('tasksDone', 0) == 0;
     }
 
-    // Payment flow (payAndCompleteTask): the poster lowers their OWN wallet and
-    // credits the helper they hired in one batch. Wallet top-ups are admin-only.
-    // Own rating numbers can't be touched; a helper's can only move by one task's
-    // worth (one rating of 1-5, one more task done). In production, replace with
-    // Cloud Functions using the Admin SDK.
-    function isPaymentWalletUpdate(userId) {
+    // The owner lowering their OWN earnings: a withdrawal request (the /withdrawals
+    // rule checks the amounts match, in the same batch).
+    function isEarningsWithdrawal(userId) {
       return isActiveUser()
-        && changedUserKeys().hasOnly(['walletBalance', 'realBalance', 'ratingSum', 'ratingCount', 'tasksDone'])
-        && ((userId == request.auth.uid
-              && !changedUserKeys().hasAny(['ratingSum', 'ratingCount', 'tasksDone'])
-              && request.resource.data.get('walletBalance', 0) <= resource.data.get('walletBalance', 0)
-              && request.resource.data.get('realBalance', 0) <= resource.data.get('realBalance', 0))
-            || (userId != request.auth.uid
-              && !changedUserKeys().hasAny(['realBalance'])
-              && request.resource.data.get('walletBalance', 0) >= resource.data.get('walletBalance', 0)
-              && request.resource.data.get('ratingCount', 0) - resource.data.get('ratingCount', 0) >= 0
-              && request.resource.data.get('ratingCount', 0) - resource.data.get('ratingCount', 0) <= 1
-              && request.resource.data.get('tasksDone', 0) - resource.data.get('tasksDone', 0) >= 0
-              && request.resource.data.get('tasksDone', 0) - resource.data.get('tasksDone', 0) <= 1
-              && request.resource.data.get('ratingSum', 0) - resource.data.get('ratingSum', 0) >= 0
-              && request.resource.data.get('ratingSum', 0) - resource.data.get('ratingSum', 0) <= 5));
+        && userId == request.auth.uid
+        && changedUserKeys().hasOnly(['earnings'])
+        && request.resource.data.get('earnings', 0) <= resource.data.get('earnings', 0);
+    }
+
+    // A poster rating the helper they hired when the task is closed without payment
+    // (payments off). The rating is only accepted together with the completion of a task the
+    // poster really hired this helper for: `lastRatedTaskId` names that task and the same
+    // batch must move it from 'assigned' to 'completed' with a workerRating equal to what is
+    // added to ratingSum (one more rating, one more task). Because the task can only be
+    // completed once, a rating can only be given once per task. While Razorpay is on the
+    // payment Cloud Function does this, so the app is not allowed to.
+    function isHelperRatingUpdate(userId) {
+      return isActiveUser()
+        && !razorpayIsOn()
+        && userId != request.auth.uid
+        && changedUserKeys().hasOnly(['ratingSum', 'ratingCount', 'tasksDone', 'lastRatedTaskId'])
+        && request.resource.data.get('lastRatedTaskId', null) is string
+        && ratingMatchesClosedTask(userId, request.resource.data.lastRatedTaskId);
+    }
+
+    function ratingMatchesClosedTask(helperUid, taskId) {
+      let before = get(/databases/$(database)/documents/tasks/$(taskId)).data;
+      let after = getAfter(/databases/$(database)/documents/tasks/$(taskId)).data;
+      return before.postedByUid == request.auth.uid
+        && before.get('acceptedByUid', '') == helperUid
+        && before.status == 'assigned'
+        && after.status == 'completed'
+        && after.get('workerRating', 0) is number
+        && after.workerRating >= 1
+        && after.workerRating <= 5
+        && request.resource.data.get('ratingCount', 0) - resource.data.get('ratingCount', 0) == 1
+        && request.resource.data.get('tasksDone', 0) - resource.data.get('tasksDone', 0) == 1
+        && math.abs((request.resource.data.get('ratingSum', 0) - resource.data.get('ratingSum', 0))
+                    - after.workerRating) < 0.001;
     }
 
     // ===== ADMINS COLLECTION =====
@@ -210,41 +239,88 @@ service cloud.firestore {
       allow read: if isAuthenticated();
 
       // Creating a profile: the owner may not set moderation flags, and may only
-      // start with the standard wallet/rating values (see startsWithStandardEconomy).
+      // start with the standard earnings/rating values (see startsWithStandardEconomy).
       allow create: if isAdmin()
         || (isOwner(userId)
             && !request.resource.data.keys().hasAny(['isBanned', 'isPaused', 'canPost'])
-            && (!request.resource.data.keys().hasAny(['walletBalance', 'realBalance', 'ratingSum', 'ratingCount', 'tasksDone'])
-                || (request.resource.data.get('walletBalance', 500) == 500
-                    && request.resource.data.get('realBalance', 0) == 0
+            && request.resource.data.get('idProofStatus', 'Not Uploaded') in ['Not Uploaded', 'Pending Verification']
+            && isValidUpiOrAbsent()
+            && (!request.resource.data.keys().hasAny(['earnings', 'feeDue', 'ratingSum', 'ratingCount', 'tasksDone'])
+                || (request.resource.data.get('earnings', 0) == 0
+                    && request.resource.data.get('feeDue', 0) == 0
                     && request.resource.data.get('ratingSum', 0) == 0
                     && request.resource.data.get('ratingCount', 0) == 0
                     && request.resource.data.get('tasksDone', 0) == 0)));
 
-      // Three ways a user document can be updated:
+      // Four ways a user document can be updated:
       //  1. an admin (anything),
       //  2. the owner editing their own profile (isOwnerProfileEdit),
-      //  3. the payment flow moving wallet / rating numbers (isPaymentWalletUpdate).
-      allow update: if isAdmin() || isOwnerProfileEdit(userId) || isPaymentWalletUpdate(userId);
+      //  3. the owner withdrawing earnings (isEarningsWithdrawal),
+      //  4. a poster rating the helper they hired, with payments off (isHelperRatingUpdate).
+      allow update: if isAdmin() || isOwnerProfileEdit(userId) || isEarningsWithdrawal(userId)
+        || isHelperRatingUpdate(userId);
 
       // The owner may delete their own profile (this is the in-app "Delete Account"
-      // button); admins may delete any.
-      allow delete: if isOwner(userId) || isAdmin();
+      // button) -- but not while banned/paused or while a cash-job fee is still owed, or
+      // deleting and re-creating the profile would wipe the ban and the fee. Admins may
+      // delete any.
+      allow delete: if isAdmin()
+        || (isOwner(userId) && isActiveUser() && resource.data.get('feeDue', 0) == 0);
+
+      // Private owner-only documents (the link to the uploaded ID photo). Unlike the profile
+      // above, other signed-in users cannot read these: a Storage download link works for
+      // anyone who holds it, so it must not sit in a document everybody can read.
+      match /private/{docId} {
+        allow read: if isOwner(userId) || isAdmin();
+        allow create, update: if isOwner(userId) && docId == 'idProof'
+          && request.resource.data.keys().hasOnly(['url', 'path', 'updatedAt'])
+          && request.resource.data.keys().hasAll(['url', 'path'])
+          && request.resource.data.url is string
+          && request.resource.data.url.size() <= 2000
+          && request.resource.data.url.matches('^https://firebasestorage\\.googleapis\\.com/.*')
+          && request.resource.data.path is string
+          && request.resource.data.path.matches('^id_proofs/' + userId + '\\..+$');
+        allow delete: if isOwner(userId) || isAdmin();
+      }
 
       // Notifications: owner reads/updates. Any active (non-banned/paused) user
       // can create one in someone else's mailbox (needed for apply/offer/pay
-      // flows), but must not be able to impersonate a different sender.
+      // flows), but must not be able to impersonate a different sender, and the
+      // message has a fixed shape so a mailbox (and the push it triggers) cannot
+      // be used to deliver arbitrary content.
       // Admins may also write into any mailbox (the panel's broadcast screen).
       match /notifications/{notifId} {
         allow read, update, delete: if isOwner(userId);
-        allow create: if (isAdmin() || isActiveUser())
-          && request.resource.data.get('fromUid', null) == request.auth.uid;
+        allow create: if (isAdmin()
+            && request.resource.data.get('fromUid', null) == request.auth.uid)
+          || (isActiveUser()
+            && request.resource.data.get('fromUid', null) == request.auth.uid
+            && request.resource.data.keys().hasOnly(['fromUid', 'taskId', 'title', 'message', 'createdAt', 'isRead', 'type'])
+            && request.resource.data.keys().hasAll(['fromUid', 'title', 'message', 'createdAt'])
+            && request.resource.data.title is string && request.resource.data.title.size() <= 200
+            && request.resource.data.message is string && request.resource.data.message.size() <= 1000
+            && request.resource.data.get('isRead', false) == false
+            && request.resource.data.createdAt == request.time
+            && request.resource.data.get('type', 'general') in ['general', 'task_proposed', 'offer_accepted',
+                 'offer_declined', 'offer_revised', 'worker_done', 'task_completed']);
       }
 
-      // Transactions: only owner can read; active auth users can create (payment flow)
+      // Transactions (the earnings history): only the owner can read. Payments are written
+      // by the payment Cloud Function (Admin SDK) and admins write refunds. The only line
+      // the owner can add is "withdrawal requested", which must come in the same batch as
+      // the withdrawal it names (same person, same amount), so nobody can fake a payment
+      // or a credit in their own history. Nobody can write into someone else's history.
       match /transactions/{txId} {
         allow read: if isOwner(userId) || isAdmin();
-        allow create: if isAuthenticated();
+        allow create: if isAdmin()
+          || (isOwner(userId)
+              && request.resource.data.keys().hasOnly(['amount', 'type', 'razorpay', 'title', 'withdrawalId', 'timestamp'])
+              && request.resource.data.type == 'debit'
+              && request.resource.data.withdrawalId is string
+              && getAfter(/databases/$(database)/documents/withdrawals/$(request.resource.data.withdrawalId)).data.uid
+                   == request.auth.uid
+              && getAfter(/databases/$(database)/documents/withdrawals/$(request.resource.data.withdrawalId)).data.amount
+                   == request.resource.data.amount);
         allow update, delete: if false;
       }
 
@@ -271,11 +347,32 @@ service cloud.firestore {
             || isAdmin());
 
       // Only active (not banned/paused) users with non-rejected ID can post tasks.
+      // A task starts OPEN (public), or as a PRIVATE direct request to one named helper
+      // (never to yourself). Nothing can be created already hired out or completed.
+      // Only the fields the app sends are accepted, so a new task cannot carry payment
+      // records (paidViaRazorpay, finalPricePaid, cash fees...), a pre-chosen helper or fake
+      // applicants.
       allow create: if isActiveUser()
         && isNotIdRejected()
-        && request.auth.uid == request.resource.data.postedByUid;
+        && request.auth.uid == request.resource.data.postedByUid
+        && request.resource.data.keys().hasOnly(['postedByUid', 'postedByName', 'title', 'description', 'price',
+             'category', 'city', 'isUrgent', 'status', 'targetHelperUid', 'directRequest', 'proposedPrice',
+             'proposedAt', 'startLocation', 'destinationLocation', 'imageUrl', 'createdAt', 'endTime',
+             'applicants', 'bids'])
+        && request.resource.data.price is number
+        && request.resource.data.price >= 0
+        && request.resource.data.createdAt == request.time
+        && (request.resource.data.status == 'open'
+            ? (request.resource.data.get('applicants', []).size() == 0
+               && request.resource.data.get('bids', {}).size() == 0
+               && request.resource.data.get('targetHelperUid', null) == null)
+            : (request.resource.data.status == 'pending_worker_acceptance'
+                && request.resource.data.get('directRequest', false) == true
+                && request.resource.data.get('targetHelperUid', null) is string
+                && request.resource.data.targetHelperUid != request.auth.uid
+                && request.resource.data.get('applicants', []) == [request.resource.data.targetHelperUid]));
 
-      // Active authenticated users can update (apply, bid, assign, markDone, pay) —
+      // Active authenticated users can update (apply, bid, assign, markDone, complete) —
       // but ONLY through one of the specific, role-scoped transitions below.
       // Rejected users may still update (e.g. mark done on assigned tasks) but NOT create.
       // postedByUid is immutable after creation no matter which branch below matches.
@@ -283,47 +380,78 @@ service cloud.firestore {
       allow update: if isAdmin() || (isActiveUser()
         && request.resource.data.postedByUid == resource.data.postedByUid
         && (
-          // A helper applies to an open task (adds themselves + their own bid only).
+          // A helper applies to an open task: adds themselves (nobody else is added and
+          // nobody is removed from the list) and sets their own bid only.
           (taskKeysChangedOnly(['applicants', 'bids'])
             && resource.data.status == 'open'
+            && request.auth.uid != resource.data.postedByUid
             && request.auth.uid in request.resource.data.applicants
+            && request.resource.data.applicants.toSet()
+                .difference(resource.data.get('applicants', []).toSet()).hasOnly([request.auth.uid])
+            && resource.data.get('applicants', []).toSet()
+                .difference(request.resource.data.applicants.toSet()).size() == 0
             && request.resource.data.get('bids', {}).diff(resource.data.get('bids', {}))
-                .affectedKeys().hasOnly([request.auth.uid]))
+                .affectedKeys().hasOnly([request.auth.uid])
+            && request.resource.data.bids.get(request.auth.uid, 0) is number
+            && request.resource.data.bids.get(request.auth.uid, 0) > 0)
 
-          // Poster proposes the task directly to a specific helper.
+          // Poster proposes an OPEN task to a specific helper.
           || (isTaskPoster()
+              && resource.data.status == 'open'
               && taskKeysChangedOnly(['status', 'targetHelperUid', 'applicants', 'proposedPrice', 'proposedAt'])
-              && request.resource.data.status == 'pending_worker_acceptance')
+              && request.resource.data.status == 'pending_worker_acceptance'
+              && request.resource.data.targetHelperUid is string
+              && request.resource.data.targetHelperUid != request.auth.uid
+              && request.resource.data.get('proposedPrice', 0) > 0)
 
-          // Poster or the targeted helper accepts a pending proposal — only the
-          // bid entry for the helper being assigned may change.
-          || ((isTaskPoster() || isTaskTargetHelper())
+          // The targeted helper accepts the poster's offer, or the poster accepts the helper's
+          // counter-offer. Only the person the offer is addressed to can be assigned (so nobody
+          // can be hired without having been offered the job) and only that bid entry changes.
+          || (((isTaskTargetHelper() && resource.data.status == 'pending_worker_acceptance')
+                || (isTaskPoster() && resource.data.status == 'pending_poster_acceptance'))
               && taskKeysChangedOnly(['status', 'acceptedByUid', 'assignedAt', 'bids'])
               && request.resource.data.status == 'assigned'
+              && request.resource.data.acceptedByUid == resource.data.get('targetHelperUid', null)
               && request.resource.data.get('bids', {}).diff(resource.data.get('bids', {}))
                   .affectedKeys().hasOnly([request.resource.data.acceptedByUid]))
 
-          // Poster or the targeted helper declines a pending proposal.
+          // Poster or the targeted helper declines a pending proposal. On a public task it goes
+          // back to open; a private direct request can only end as 'declined' -- it never
+          // becomes public by itself.
           || ((isTaskPoster() || isTaskTargetHelper())
+              && resource.data.status in ['pending_worker_acceptance', 'pending_poster_acceptance']
               && taskKeysChangedOnly(['status', 'targetHelperUid', 'proposedPrice', 'proposedAt'])
-              && request.resource.data.status == 'open')
+              && ((request.resource.data.status == 'open'
+                    && resource.data.get('directRequest', false) != true)
+                  || (request.resource.data.status == 'declined'
+                    && resource.data.get('directRequest', false) == true)))
 
-          // Poster or the targeted helper sends a counter-offer.
-          || ((isTaskPoster() || isTaskTargetHelper())
+          // Poster or the targeted helper sends a counter-offer, only while an offer is open
+          // (never on a hired or finished task). The poster's counter goes to the helper, the
+          // helper's counter goes to the poster.
+          || (((isTaskPoster() && request.resource.data.status == 'pending_worker_acceptance')
+                || (isTaskTargetHelper() && request.resource.data.status == 'pending_poster_acceptance'))
+              && resource.data.status in ['pending_worker_acceptance', 'pending_poster_acceptance']
               && taskKeysChangedOnly(['status', 'proposedPrice', 'proposedAt'])
-              && (request.resource.data.status == 'pending_worker_acceptance'
-                  || request.resource.data.status == 'pending_poster_acceptance'))
+              && request.resource.data.get('proposedPrice', 0) > 0)
 
           // The assigned worker marks their side of the task as done.
           || (isAssignedWorker()
-              && taskKeysChangedOnly(['workerCompleted', 'workerCompletedAt']))
+              && resource.data.status == 'assigned'
+              && taskKeysChangedOnly(['workerCompleted', 'workerCompletedAt'])
+              && request.resource.data.get('workerCompleted', false) == true)
 
-          // Poster pays out and closes the task (amountPaidByPoster / discount* record
-          // what was actually charged when an admin discount applied).
+          // Poster closes a hired task and rates the helper (1-5) while payments are OFF
+          // (nothing is charged). While Razorpay is on, the payment Cloud Function completes
+          // the task.
           || (isTaskPoster()
-              && taskKeysChangedOnly(['status', 'completedAt', 'finalPricePaid', 'workerRating',
-                                      'amountPaidByPoster', 'discountPercent', 'discountAmount'])
-              && request.resource.data.status == 'completed')
+              && !razorpayIsOn()
+              && resource.data.status == 'assigned'
+              && taskKeysChangedOnly(['status', 'completedAt', 'workerRating'])
+              && request.resource.data.status == 'completed'
+              && request.resource.data.get('workerRating', 0) is number
+              && request.resource.data.workerRating >= 1
+              && request.resource.data.workerRating <= 5)
 
           // Anyone may flip a task to 'expired' (client-triggered cleanup), but
           // only if it's genuinely open and past its own endTime.
@@ -333,24 +461,38 @@ service cloud.firestore {
               && request.resource.data.status == 'expired')
         ));
 
-      // Only the task poster or an admin can delete a task.
-      allow delete: if (isActiveUser() && request.auth.uid == resource.data.postedByUid)
+      // Only the task poster or an admin can delete a task. A hired or finished task is a
+      // record (people, money, rating) and stays; only an admin can remove it.
+      allow delete: if (isActiveUser() && request.auth.uid == resource.data.postedByUid
+                        && resource.data.status in ['open', 'expired', 'declined',
+                             'pending_worker_acceptance', 'pending_poster_acceptance'])
         || isAdmin();
 
-      // Task activity log -- readable by whoever can read the task itself.
+      // Task activity log -- readable by whoever can read the task itself. Entries can only be
+      // added by someone who can see the task, in their own name, in the fixed shape.
       match /taskLog/{logId} {
         allow read: if isAuthenticated() && (canReadTask(taskId) || isAdmin());
-        allow create: if isAuthenticated();
+        allow create: if isAuthenticated()
+          && (canReadTask(taskId) || isAdmin())
+          && request.resource.data.keys().hasOnly(['action', 'actorUid', 'details', 'timestamp'])
+          && request.resource.data.actorUid == request.auth.uid
+          && request.resource.data.get('action', '').size() <= 60
+          && request.resource.data.get('details', '').size() <= 2000;
         allow update, delete: if false; // Logs are immutable
       }
     }
 
     // ===== REVIEWS COLLECTION =====
-    // One public review (rating + category only) per paid task. The task itself
-    // stays private; this is what shows under "Recent Reviews" on a profile.
+    // One public review (rating + category only) per completed task. The task itself
+    // stays private; this is what shows under "Recent Reviews" on a profile. While Razorpay
+    // is on, the payment Cloud Function writes it after a confirmed payment.
     match /reviews/{reviewId} {
       allow read: if isAuthenticated();
+      // It is written in the same batch that completes the task (checked with getAfter), with
+      // the same rating the poster gave, so a review cannot exist without a finished job.
       allow create: if isActiveUser()
+        && !razorpayIsOn()
+        && request.resource.data.keys().hasOnly(['taskId', 'workerUid', 'posterUid', 'rating', 'category', 'createdAt'])
         && reviewId == request.resource.data.taskId
         && request.resource.data.posterUid == request.auth.uid
         && request.resource.data.rating is number
@@ -358,7 +500,11 @@ service cloud.firestore {
         && request.resource.data.rating <= 5
         && get(/databases/$(database)/documents/tasks/$(reviewId)).data.postedByUid == request.auth.uid
         && get(/databases/$(database)/documents/tasks/$(reviewId)).data.get('acceptedByUid', '')
-             == request.resource.data.workerUid;
+             == request.resource.data.workerUid
+        && get(/databases/$(database)/documents/tasks/$(reviewId)).data.status == 'assigned'
+        && getAfter(/databases/$(database)/documents/tasks/$(reviewId)).data.get('status', '') == 'completed'
+        && getAfter(/databases/$(database)/documents/tasks/$(reviewId)).data.get('workerRating', -1)
+             == request.resource.data.rating;
       allow update, delete: if false;
     }
 
@@ -366,15 +512,37 @@ service cloud.firestore {
     match /chats/{chatId} {
       allow read: if isAuthenticated()
         && (resource == null || request.auth.uid in resource.data.participants);
+      // A chat is between exactly two people and its id is made of their two ids (as the app
+      // builds it), so nobody can claim the chat id of two other people.
       allow create: if isActiveUser()
-        && request.auth.uid in request.resource.data.participants;
-      allow update, delete: if isActiveUser()
+        && request.resource.data.keys().hasOnly(['participants', 'lastMessage', 'lastMessageTime', 'unreadCounts'])
+        && request.resource.data.participants is list
+        && request.resource.data.participants.size() == 2
+        && request.auth.uid in request.resource.data.participants
+        && request.resource.data.participants[0] != request.resource.data.participants[1]
+        && chatId == request.resource.data.participants[0] + '_' + request.resource.data.participants[1];
+      // The people in a chat cannot be changed afterwards (nobody can add a third reader).
+      allow update: if isActiveUser()
+        && request.auth.uid in resource.data.participants
+        && request.resource.data.participants == resource.data.participants
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['lastMessage', 'lastMessageTime', 'unreadCounts']);
+      allow delete: if isActiveUser()
         && request.auth.uid in resource.data.participants;
 
       match /messages/{messageId} {
-        allow read, create: if isAuthenticated()
+        allow read: if isAuthenticated()
           && request.auth.uid in
             get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
+        // A message is sent in your own name, as plain text of a sane size.
+        allow create: if isActiveUser()
+          && request.auth.uid in
+            get(/databases/$(database)/documents/chats/$(chatId)).data.participants
+          && request.resource.data.keys().hasOnly(['senderId', 'text', 'timestamp'])
+          && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.text is string
+          && request.resource.data.text.size() <= 5000
+          && request.resource.data.timestamp == request.time;
         allow update, delete: if false;
       }
     }
@@ -382,12 +550,11 @@ service cloud.firestore {
     // ===== WITHDRAWALS COLLECTION =====
     match /withdrawals/{withdrawalId} {
       allow read: if isAuthenticated() && (request.auth.uid == resource.data.uid || isAdmin());
-      // A withdrawal request holds the money: in the SAME batch the requester's REAL balance must
+      // A withdrawal request holds the money: in the SAME batch the requester's earnings must
       // go down by exactly the amount (checked with getAfter), so the same rupees can never
-      // be asked for twice. Rejecting refunds it (admin). Only open while Razorpay is on,
-      // i.e. when a wallet holds real earnings. Amount: whole rupees, 100 to 100000.
+      // be asked for twice. Rejecting refunds it (admin). Earnings only come from confirmed
+      // Razorpay payments, so there is nothing else to check. Amount: whole rupees, 100 to 100000.
       allow create: if isActiveUser() && request.auth.uid == request.resource.data.uid
-        && razorpayIsOn()
         && request.resource.data.keys().hasOnly(['uid', 'amount', 'paymentDetails', 'userName', 'status', 'timestamp'])
         && request.resource.data.keys().hasAll(['uid', 'amount', 'paymentDetails', 'status', 'timestamp'])
         && request.resource.data.amount is int
@@ -399,13 +566,21 @@ service cloud.firestore {
         && request.resource.data.timestamp == request.time
         && (!('userName' in request.resource.data)
             || (request.resource.data.userName is string && request.resource.data.userName.size() <= 80))
-        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('realBalance', 0)
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('earnings', 0)
              >= request.resource.data.amount
-        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('realBalance', 0)
-             == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('realBalance', 0)
+        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('earnings', 0)
+             == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('earnings', 0)
                 - request.resource.data.amount;
       allow update: if isAdmin();
       allow delete: if false;
+    }
+
+    // ===== PAYOUT ACCOUNTS (server only) =====
+    // RazorpayX contact / fund-account ids used to pay helpers' UPI ids. Only the Cloud
+    // Functions (Admin SDK) use them; no app or admin panel may read or write them, so
+    // nobody can redirect a payout.
+    match /payoutAccounts/{uid} {
+      allow read, write: if false;
     }
 
     // ===== TRANSACTIONS COLLECTION GROUP =====

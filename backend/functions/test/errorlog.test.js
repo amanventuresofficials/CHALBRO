@@ -2,7 +2,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
-  clean, describeError, classify, fingerprint, buildErrorDoc, makeLimiter, REPEAT_WINDOW_MS, INSTANCE_CAP,
+  clean, redactSecrets, describeError, classify, fingerprint, buildErrorDoc, makeLimiter, REPEAT_WINDOW_MS, INSTANCE_CAP,
 } = require("../errorlog");
 
 const httpsErr = (code, message) => Object.assign(new Error(message), { code });
@@ -150,4 +150,20 @@ test("limiter: one record per problem per window, and a hard cap", () => {
   let allowed = 0;
   for (let i = 0; i < INSTANCE_CAP + 50; i++) if (capped.allow(`fp${i}`)) allowed++;
   assert.equal(allowed, INSTANCE_CAP);
+});
+
+test("secret values are removed from anything that gets logged", () => {
+  const env = { RAZORPAY_KEY_SECRET: "s3cr3tValue123", RAZORPAYX_WEBHOOK_SECRET: "webhookSecretXYZ" };
+  assert.equal(redactSecrets("failed with s3cr3tValue123 and webhookSecretXYZ!", env), "failed with <secret> and <secret>!");
+  assert.equal(redactSecrets("nothing to hide", env), "nothing to hide");
+  // a missing or very short value must never blank out ordinary text
+  assert.equal(redactSecrets("abc", { RAZORPAY_KEY_SECRET: "" }), "abc");
+  assert.equal(redactSecrets("abc", { RAZORPAY_KEY_SECRET: "ab" }), "abc");
+  const saved = process.env.RAZORPAY_KEY_SECRET;
+  process.env.RAZORPAY_KEY_SECRET = "liveSecretAbc987";
+  try {
+    assert.equal(clean("Razorpay said liveSecretAbc987 is wrong", 100), "Razorpay said <secret> is wrong");
+  } finally {
+    if (saved === undefined) delete process.env.RAZORPAY_KEY_SECRET; else process.env.RAZORPAY_KEY_SECRET = saved;
+  }
 });

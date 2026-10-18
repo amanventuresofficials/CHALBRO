@@ -18,11 +18,31 @@ const INSTANCE_CAP = 200;
 
 // A caller doing something ordinary -- nothing for the owner to look at.
 const QUIET_CODES = new Set(["unauthenticated", "invalid-argument", "not-found", "already-exists", "cancelled"]);
-const QUIET_MESSAGES = [/already been paid/i, /hire a helper/i, /not awaiting payment/i];
+const QUIET_MESSAGES = [
+  /already been paid/i,
+  /hire a helper/i,
+  /not awaiting payment/i,
+  /already completed/i,
+  /switched off/i,
+  /no cash payment/i,
+];
 
-/** Truncates and masks e-mail addresses and long digit runs (phone numbers). */
+// Environment variables whose VALUE must never appear in a log, whatever the error text happens to contain.
+const SECRET_ENV_NAMES = ["RAZORPAY_KEY_SECRET", "RAZORPAYX_WEBHOOK_SECRET"];
+
+/** Replaces any secret value found in `text` (defence in depth: nothing should put one there). */
+function redactSecrets(text, env = process.env) {
+  let s = String(text == null ? "" : text);
+  for (const name of SECRET_ENV_NAMES) {
+    const value = env[name];
+    if (value && value.length >= 6) s = s.split(value).join("<secret>");
+  }
+  return s;
+}
+
+/** Truncates, hides secret values and masks e-mail addresses and long digit runs (phone numbers). */
 function clean(text, max) {
-  let s = String(text == null ? "" : text)
+  let s = redactSecrets(text)
     .replace(/[\w.+-]+@[\w-]+(\.[\w-]+)+/g, "<email>")
     .replace(/\+?\d[\d\s-]{8,}\d/g, "<number>");
   if (s.length > max) s = `${s.slice(0, max - 1)}…`;
@@ -172,6 +192,7 @@ module.exports = {
   REPEAT_WINDOW_MS,
   INSTANCE_CAP,
   clean,
+  redactSecrets,
   describeError,
   classify,
   fingerprint,
