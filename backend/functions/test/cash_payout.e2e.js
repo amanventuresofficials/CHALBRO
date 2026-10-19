@@ -131,67 +131,14 @@ const payoutEvent = (event, reference, status, extra = {}) => ({ event, payload:
 async function main() {
   await db.doc(`users/${POSTER}`).set({ fullName: "Poster" });
 
-  console.log("Cash jobs: claim and confirm");
-  await check("the poster claims a cash payment: the task keeps waiting and the helper is told", async () => {
+  console.log("Cash jobs: the poster says 'paid in cash' and the task is completed at once");
+  await check("the poster says paid in cash: the task is completed, the helper owes the fee and is told", async () => {
     await resetWorker();
     await setConfig({ useRazorpay: true });
-    await seedTask("c1");
+    await seedTask("c1", { title: "Paint wall", price: 450, bids: { [WORKER]: 450 } });
     const r = await fns.claimCashPayment.run({ taskId: "c1", givenRating: 4 }, asPoster);
-    assert.equal(r.success, true);
-    assert.equal(r.fee, 30);
+    assert.deepEqual(r, { success: true, completed: true, fee: 45 });
     const t = await getDoc("tasks/c1");
-    assert.equal(t.status, "assigned");
-    assert.ok(t.cashClaimedAt);
-    assert.equal(t.cashClaimRating, 4);
-    const notes = await col(`users/${WORKER}/notifications`);
-    assert.equal(notes.length, 1);
-    assert.equal(notes[0].type, "cash_claim");
-    assert.match(notes[0].message, /₹300/);
-    assert.match(notes[0].message, /₹30/);
-    assert.equal((await user()).feeDue, undefined, "no fee is owed until the helper confirms");
-  });
-
-  await check("only the poster can claim; only while payments are on; not twice for a finished task", async () => {
-    await seedTask("c2");
-    assert.equal((await rejects(() => fns.claimCashPayment.run({ taskId: "c2" }, { auth: { uid: "cp_intruder" } }))).code, "permission-denied");
-    assert.equal((await rejects(() => fns.claimCashPayment.run({ taskId: "c2" }, {}))).code, "unauthenticated");
-    await setConfig({ useRazorpay: false });
-    assert.equal((await rejects(() => fns.claimCashPayment.run({ taskId: "c2" }, asPoster))).code, "failed-precondition");
-    await setConfig({ useRazorpay: true });
-    await seedTask("c2done", { status: "completed" });
-    assert.equal((await rejects(() => fns.claimCashPayment.run({ taskId: "c2done" }, asPoster))).code, "failed-precondition");
-    assert.equal((await db.collection("errorLogs").where("context", "==", "Function: claimCashPayment").get()).docs.filter((d) => d.data().severity !== "error").length, 0);
-  });
-
-  await check("the helper cannot be given a fee without answering: only the hired helper can answer, and only after a claim", async () => {
-    await seedTask("c3");
-    assert.equal((await rejects(() => fns.answerCashPayment.run({ taskId: "c3", received: true }, asWorker))).code, "failed-precondition");
-    await fns.claimCashPayment.run({ taskId: "c3", givenRating: 5 }, asPoster);
-    assert.equal((await rejects(() => fns.answerCashPayment.run({ taskId: "c3", received: true }, asPoster))).code, "permission-denied");
-    assert.equal((await rejects(() => fns.answerCashPayment.run({ taskId: "c3" }, asWorker))).code, "invalid-argument");
-  });
-
-  await check("the helper says 'not received': the claim is cleared, nothing is owed, the poster is told", async () => {
-    await resetWorker();
-    await seedTask("c4");
-    await fns.claimCashPayment.run({ taskId: "c4", givenRating: 5 }, asPoster);
-    const r = await fns.answerCashPayment.run({ taskId: "c4", received: false }, asWorker);
-    assert.equal(r.confirmed, false);
-    const t = await getDoc("tasks/c4");
-    assert.equal(t.status, "assigned");
-    assert.equal(t.cashClaimedAt, undefined);
-    assert.equal((await user()).feeDue, undefined);
-    const notes = await col(`users/${POSTER}/notifications`);
-    assert.ok(notes.some((n) => n.type === "cash_denied"));
-  });
-
-  await check("the helper confirms: task completed as a cash job, fee owed, rating and review recorded", async () => {
-    await resetWorker();
-    await seedTask("c5", { title: "Paint wall", price: 450, bids: { [WORKER]: 450 } });
-    await fns.claimCashPayment.run({ taskId: "c5", givenRating: 4 }, asPoster);
-    const r = await fns.answerCashPayment.run({ taskId: "c5", received: true }, asWorker);
-    assert.deepEqual(r, { success: true, confirmed: true, fee: 45 });
-    const t = await getDoc("tasks/c5");
     assert.equal(t.status, "completed");
     assert.equal(t.paidInCash, true);
     assert.equal(t.cashAmount, 450);
@@ -199,17 +146,143 @@ async function main() {
     assert.equal(t.workerRating, 4);
     assert.equal(t.finalPricePaid, undefined, "a cash job is not an online payment");
     assert.equal(t.cashClaimedAt, undefined);
+    assert.ok(t.completedAt);
     const u = await user();
     assert.equal(u.feeDue, 45);
     assert.equal(u.tasksDone, 1);
     assert.equal(u.ratingCount, 1);
     assert.equal(u.ratingSum, 4);
     assert.equal(u.earnings, undefined, "cash never touches earnings");
-    assert.equal((await getDoc("reviews/c5")).rating, 4);
+    assert.equal((await getDoc("reviews/c1")).rating, 4);
     assert.equal((await col(`users/${WORKER}/transactions`)).length, 0);
-    const again = await fns.answerCashPayment.run({ taskId: "c5", received: true }, asWorker);
+    const notes = await col(`users/${WORKER}/notifications`);
+    assert.equal(notes.length, 1);
+    assert.equal(notes[0].type, "task_completed");
+    assert.match(notes[0].message, /₹450/);
+    assert.match(notes[0].message, /₹45/);
+    assert.match(notes[0].message, /Not received/);
+    const log = (await col("tasks/c1/taskLog")).map((l) => l.action);
+    assert.ok(log.includes("cash_paid"));
+  });
+
+  await check("saying it twice does not charge the fee twice", async () => {
+    const again = await fns.claimCashPayment.run({ taskId: "c1", givenRating: 5 }, asPoster).catch((e) => e);
+    assert.equal(again.code, "failed-precondition");
+    assert.equal((await user()).feeDue, 45);
+    assert.equal((await user()).tasksDone, 1);
+  });
+
+  await check("only the poster can say it; only while payments are on; not for a finished task", async () => {
+    await seedTask("c2");
+    assert.equal((await rejects(() => fns.claimCashPayment.run({ taskId: "c2" }, { auth: { uid: "cp_intruder" } }))).code, "permission-denied");
+    assert.equal((await rejects(() => fns.claimCashPayment.run({ taskId: "c2" }, {}))).code, "unauthenticated");
+    assert.equal((await rejects(() => fns.claimCashPayment.run({ taskId: "c2" }, asWorker))).code, "permission-denied");
+    await setConfig({ useRazorpay: false });
+    assert.equal((await rejects(() => fns.claimCashPayment.run({ taskId: "c2" }, asPoster))).code, "failed-precondition");
+    await setConfig({ useRazorpay: true });
+    await seedTask("c2done", { status: "completed" });
+    assert.equal((await rejects(() => fns.claimCashPayment.run({ taskId: "c2done" }, asPoster))).code, "failed-precondition");
+    await seedTask("c2open", { status: "open", acceptedByUid: null });
+    assert.equal((await rejects(() => fns.claimCashPayment.run({ taskId: "c2open" }, asPoster))).code, "failed-precondition");
+    assert.equal((await getDoc("tasks/c2")).status, "assigned", "a refused claim changes nothing");
+    assert.equal((await db.collection("errorLogs").where("context", "==", "Function: claimCashPayment").get()).docs.filter((d) => d.data().severity !== "error").length, 0);
+  });
+
+  console.log("The helper can say 'not received'");
+  await check("'not received': the fee comes off again, the task is flagged, the poster is told", async () => {
+    await resetWorker();
+    await setConfig({ useRazorpay: true });
+    await seedTask("d1");
+    await fns.claimCashPayment.run({ taskId: "d1", givenRating: 5 }, asPoster);
+    assert.equal((await user()).feeDue, 30);
+    const r = await fns.answerCashPayment.run({ taskId: "d1", received: false }, asWorker);
+    assert.deepEqual(r, { success: true, disputed: true, feeReversed: 30 });
+    const t = await getDoc("tasks/d1");
+    assert.equal(t.cashDisputed, true);
+    assert.ok(t.cashDisputedAt);
+    assert.equal(t.status, "completed", "the task stays completed; the admin looks into the dispute");
+    assert.equal((await user()).feeDue, 0);
+    const notes = await col(`users/${POSTER}/notifications`);
+    assert.ok(notes.some((n) => n.type === "cash_denied"));
+    assert.ok((await col("tasks/d1/taskLog")).some((l) => l.action === "cash_disputed"));
+  });
+
+  await check("disputing twice reverses nothing more", async () => {
+    const r = await fns.answerCashPayment.run({ taskId: "d1", received: false }, asWorker);
+    assert.equal(r.alreadyDisputed, true);
+    assert.equal((await user()).feeDue, 0);
+  });
+
+  await check("only the hired helper can dispute; 'I got it' on a completed cash job changes nothing", async () => {
+    await resetWorker();
+    await seedTask("d2");
+    await fns.claimCashPayment.run({ taskId: "d2", givenRating: 5 }, asPoster);
+    assert.equal((await rejects(() => fns.answerCashPayment.run({ taskId: "d2", received: false }, asPoster))).code, "permission-denied");
+    assert.equal((await rejects(() => fns.answerCashPayment.run({ taskId: "d2", received: false }, { auth: { uid: "cp_intruder" } }))).code, "permission-denied");
+    assert.equal((await rejects(() => fns.answerCashPayment.run({ taskId: "d2" }, asWorker))).code, "invalid-argument");
+    const ok = await fns.answerCashPayment.run({ taskId: "d2", received: true }, asWorker);
+    assert.equal(ok.confirmed, true);
+    assert.equal((await user()).feeDue, 30);
+    assert.equal((await getDoc("tasks/d2")).cashDisputed, undefined);
+  });
+
+  await check("a dispute only takes back what is still owed (part of the fee was already recovered)", async () => {
+    await resetWorker({ feeDue: 10 });
+    await seedTask("d3", { status: "completed", paidInCash: true, cashAmount: 300, cashFee: 30, completedAt: admin.firestore.Timestamp.now() });
+    const r = await fns.answerCashPayment.run({ taskId: "d3", received: false }, asWorker);
+    assert.equal(r.feeReversed, 10);
+    assert.equal((await user()).feeDue, 0, "never below zero");
+  });
+
+  await check("too late: after 7 days the dispute goes to support", async () => {
+    await resetWorker({ feeDue: 30 });
+    await seedTask("d4", { status: "completed", paidInCash: true, cashAmount: 300, cashFee: 30, completedAt: admin.firestore.Timestamp.fromMillis(Date.now() - 8 * 24 * 3600 * 1000) });
+    const e = await rejects(() => fns.answerCashPayment.run({ taskId: "d4", received: false }, asWorker));
+    assert.equal(e.code, "failed-precondition");
+    assert.match(e.message, /support@chalbro\.in/);
+    assert.equal((await user()).feeDue, 30);
+    assert.equal((await getDoc("tasks/d4")).cashDisputed, undefined);
+  });
+
+  await check("an online-paid task cannot be disputed as cash", async () => {
+    await resetWorker({ feeDue: 30 });
+    await seedTask("d5", { status: "completed", paidViaRazorpay: true, finalPricePaid: 300 });
+    const r = await fns.answerCashPayment.run({ taskId: "d5", received: false }, asWorker);
+    assert.equal(r.alreadyCompleted, true);
+    assert.equal((await user()).feeDue, 30, "nothing is reversed for an online payment");
+    assert.equal((await getDoc("tasks/d5")).cashDisputed, undefined);
+  });
+
+  console.log("Older app builds: a claim that waits for the helper still works");
+  await check("an old-style waiting claim: the helper confirms and the task completes", async () => {
+    await resetWorker();
+    await seedTask("o1", { price: 450, bids: { [WORKER]: 450 }, cashClaimedAt: admin.firestore.Timestamp.now(), cashClaimRating: 4 });
+    const r = await fns.answerCashPayment.run({ taskId: "o1", received: true }, asWorker);
+    assert.deepEqual(r, { success: true, confirmed: true, fee: 45 });
+    const t = await getDoc("tasks/o1");
+    assert.equal(t.status, "completed");
+    assert.equal(t.paidInCash, true);
+    assert.equal(t.workerRating, 4);
+    assert.equal((await user()).feeDue, 45);
+    const again = await fns.answerCashPayment.run({ taskId: "o1", received: true }, asWorker);
     assert.equal(again.alreadyCompleted, true);
     assert.equal((await user()).feeDue, 45, "answering twice does not charge twice");
+  });
+
+  await check("an old-style waiting claim: 'not received' clears it and nothing is owed", async () => {
+    await resetWorker();
+    await seedTask("o2", { cashClaimedAt: admin.firestore.Timestamp.now(), cashClaimRating: 5 });
+    const r = await fns.answerCashPayment.run({ taskId: "o2", received: false }, asWorker);
+    assert.equal(r.confirmed, false);
+    const t = await getDoc("tasks/o2");
+    assert.equal(t.status, "assigned");
+    assert.equal(t.cashClaimedAt, undefined);
+    assert.equal((await user()).feeDue, undefined);
+  });
+
+  await check("answering when nothing was reported is refused", async () => {
+    await seedTask("o3");
+    assert.equal((await rejects(() => fns.answerCashPayment.run({ taskId: "o3", received: true }, asWorker))).code, "failed-precondition");
   });
 
   console.log("Owed fees are taken from the next online payments");

@@ -390,9 +390,53 @@ exports.verifyRazorpayPayment = functions.runWith({ secrets: PAYMENT_SECRETS }).
 // owed by the helper (`feeDue` on their user document) and is taken out of their next
 // online payments (see verifyRazorpayPayment) until it is settled.
 //
-// Two steps so a poster cannot put a fee on a helper alone:
-//   claimCashPayment   the poster says they paid cash (and gives the rating)
-//   answerCashPayment  the helper confirms they received it (or says they did not)
+//   claimCashPayment   the poster says they paid cash (and gives the rating): the task is
+//                      COMPLETED at once, the helper is told and now owes the fee.
+//   answerCashPayment  the helper can say "I did not receive it" within DISPUTE_DAYS: the fee is
+//                      taken off again and the task is flagged for the admin to look at.
+//
+// (Older app builds asked the helper to confirm BEFORE completing; a claim made that way, still
+// waiting on the task as `cashClaimedAt`, is still answered the old way below.)
+
+const DISPUTE_DAYS = 7;
+
+async function completeCashTask({ taskRef, task, posterUid, helperUid, agreed, fee, rating, requireClaim }) {
+  const db = admin.firestore();
+  const workerRef = db.collection("users").doc(helperUid);
+  const now = FieldValue.serverTimestamp();
+  return db.runTransaction(async (tx) => {
+    const fresh = await tx.get(taskRef);
+    const f = fresh.data();
+    if (f.status === "completed") return false;
+    if (f.status !== "assigned" || f.acceptedByUid !== helperUid) return false;
+    if (requireClaim && !f.cashClaimedAt) return false;
+    tx.update(taskRef, {
+      status: "completed",
+      completedAt: now,
+      workerRating: rating,
+      paidInCash: true,
+      cashAmount: agreed,
+      cashFee: fee,
+      cashClaimedAt: FieldValue.delete(),
+      cashClaimRating: FieldValue.delete(),
+    });
+    tx.set(db.collection("reviews").doc(taskRef.id), {
+      taskId: taskRef.id,
+      workerUid: helperUid,
+      posterUid,
+      rating,
+      category: task.category || "Task",
+      createdAt: now,
+    });
+    tx.set(workerRef, {
+      feeDue: FieldValue.increment(fee),
+      ratingSum: FieldValue.increment(rating),
+      ratingCount: FieldValue.increment(1),
+      tasksDone: FieldValue.increment(1),
+    }, { merge: true });
+    return true;
+  });
+}
 
 exports.claimCashPayment = functions.https.onCall(withErrorLog("claimCashPayment", async (data, context) => {
   if (!context.auth) {
@@ -425,20 +469,25 @@ exports.claimCashPayment = functions.https.onCall(withErrorLog("claimCashPayment
     throw new functions.https.HttpsError("failed-precondition", "Task has no valid price.");
   }
 
-  await taskRef.update({
-    cashClaimedAt: FieldValue.serverTimestamp(),
-    cashClaimRating: clampRating(data.givenRating),
-  });
   const fee = cashFeeFor(agreed);
-  await taskLog(taskId, "cash_claimed", context.auth.uid, `Poster says ${rupees(agreed)} was paid in cash. Waiting for the helper to confirm.`);
+  const rating = clampRating(data.givenRating);
+  const done = await completeCashTask({
+    taskRef, task, posterUid: context.auth.uid, helperUid: task.acceptedByUid, agreed, fee, rating, requireClaim: false,
+  });
+  if (!done) return { success: true, alreadyCompleted: true };
+
+  const title = task.title || "your task";
+  await taskLog(taskId, "cash_paid", context.auth.uid,
+    `Poster completed the task and says ${rupees(agreed)} was paid in cash. Platform fee ${rupees(fee)} will be taken from the helper's next online payments.`);
   await notification(task.acceptedByUid, context.auth.uid, {
-    title: "Cash payment?",
-    message: `The poster says they paid you ${rupees(agreed)} in cash for "${task.title || "your task"}". `
-      + `Please confirm in the task. ChalBro's fee (${rupees(fee)}) is then taken from your next online payments.`,
-    type: "cash_claim",
+    title: "✅ Task completed - paid in cash",
+    message: `"${title}" is complete. The poster says they paid you ${rupees(agreed)} in cash. `
+      + `ChalBro's fee (${rupees(fee)}) will be taken from your next online payments. `
+      + `If you did NOT get the cash, open the task within ${DISPUTE_DAYS} days and tap "Not received".`,
+    type: "task_completed",
     taskId,
   });
-  return { success: true, fee };
+  return { success: true, completed: true, fee };
 }));
 
 exports.answerCashPayment = functions.https.onCall(withErrorLog("answerCashPayment", async (data, context) => {
@@ -459,15 +508,48 @@ exports.answerCashPayment = functions.https.onCall(withErrorLog("answerCashPayme
   if (task.acceptedByUid !== context.auth.uid) {
     throw new functions.https.HttpsError("permission-denied", "Only the hired helper can answer this.");
   }
+  const posterUid = task.postedByUid;
+  const title = task.title || "the task";
+
+  // ── A cash job that is already completed: the helper can say they did not get the cash ──
+  if (task.status === "completed" && task.paidInCash === true) {
+    if (data.received) return { success: true, confirmed: true, alreadyCompleted: true };
+    if (task.cashDisputed === true) return { success: true, alreadyDisputed: true };
+    const completedMs = task.completedAt && task.completedAt.toMillis ? task.completedAt.toMillis() : 0;
+    if (completedMs && Date.now() - completedMs > DISPUTE_DAYS * 24 * 3600 * 1000) {
+      throw new functions.https.HttpsError("failed-precondition",
+        `It is more than ${DISPUTE_DAYS} days since this task was completed. Please contact support@chalbro.in.`);
+    }
+    const fee = Number(task.cashFee) || 0;
+    const workerRef = db.collection("users").doc(context.auth.uid);
+    const reversed = await db.runTransaction(async (tx) => {
+      const [t, u] = await Promise.all([tx.get(taskRef), tx.get(workerRef)]);
+      if (t.data().cashDisputed === true) return null;
+      const owed = Number(u.data() && u.data().feeDue) || 0;
+      const take = Math.min(owed, fee);
+      tx.update(taskRef, { cashDisputed: true, cashDisputedAt: FieldValue.serverTimestamp() });
+      if (take > 0) tx.set(workerRef, { feeDue: FieldValue.increment(-take) }, { merge: true });
+      return take;
+    });
+    if (reversed === null) return { success: true, alreadyDisputed: true };
+    await taskLog(taskId, "cash_disputed", context.auth.uid,
+      `Helper says the cash payment was NOT received. The fee (${rupees(reversed)}) is no longer owed. The admin team has been flagged.`);
+    await notification(posterUid, context.auth.uid, {
+      title: "Cash payment disputed",
+      message: `The helper says they did not receive the cash for "${title}". ChalBro will look into it.`,
+      type: "cash_denied",
+      taskId,
+    });
+    return { success: true, disputed: true, feeReversed: reversed };
+  }
+
+  // ── An older-style claim that is still waiting for the helper to confirm ──
   if (task.status === "completed") {
     return { success: true, alreadyCompleted: true };
   }
   if (task.status !== "assigned" || !task.cashClaimedAt) {
     throw new functions.https.HttpsError("failed-precondition", "No cash payment has been reported for this task.");
   }
-
-  const posterUid = task.postedByUid;
-  const title = task.title || "the task";
 
   if (!data.received) {
     await taskRef.update({ cashClaimedAt: FieldValue.delete(), cashClaimRating: FieldValue.delete() });
@@ -486,38 +568,8 @@ exports.answerCashPayment = functions.https.onCall(withErrorLog("answerCashPayme
     throw new functions.https.HttpsError("failed-precondition", "Task has no valid price.");
   }
   const fee = cashFeeFor(agreed);
-  const rating = clampRating(task.cashClaimRating);
-  const workerRef = db.collection("users").doc(context.auth.uid);
-  const now = FieldValue.serverTimestamp();
-
-  const done = await db.runTransaction(async (tx) => {
-    const fresh = await tx.get(taskRef);
-    if (fresh.data().status === "completed") return false;
-    tx.update(taskRef, {
-      status: "completed",
-      completedAt: now,
-      workerRating: rating,
-      paidInCash: true,
-      cashAmount: agreed,
-      cashFee: fee,
-      cashClaimedAt: FieldValue.delete(),
-      cashClaimRating: FieldValue.delete(),
-    });
-    tx.set(db.collection("reviews").doc(taskId), {
-      taskId,
-      workerUid: context.auth.uid,
-      posterUid,
-      rating,
-      category: task.category || "Task",
-      createdAt: now,
-    });
-    tx.set(workerRef, {
-      feeDue: FieldValue.increment(fee),
-      ratingSum: FieldValue.increment(rating),
-      ratingCount: FieldValue.increment(1),
-      tasksDone: FieldValue.increment(1),
-    }, { merge: true });
-    return true;
+  const done = await completeCashTask({
+    taskRef, task, posterUid, helperUid: context.auth.uid, agreed, fee, rating: clampRating(task.cashClaimRating), requireClaim: true,
   });
   if (!done) return { success: true, alreadyCompleted: true };
 
