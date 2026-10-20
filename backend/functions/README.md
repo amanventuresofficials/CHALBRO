@@ -38,14 +38,28 @@ never end up in the error logs (`errorlog.js`, tested).
 
 The switches themselves are in the admin panel (Payments & Discount): `useRazorpay` and `autoPayout` in `metadata/paymentConfig`.
 
+## Phone sign-in captcha switch (admin panel > App Settings)
+
+`captcha.js` + three functions: `reportPhoneAuthIssue` (the app reports "too many requests" / captcha failures, it only adds to
+a counter in `phoneAuthEvents`), `captchaOnConfigWrite` (applies the choice saved in `metadata/captchaConfig`) and `captchaGuard`
+(every 2 minutes: turns Auto on/off, refreshes `metadata/captchaStatus`, deletes old counters). They set ONE field of Firebase's
+config, `recaptchaConfig.phoneEnforcementState`: Off = `AUDIT` (a failed check never blocks), On = `ENFORCE`. `OFF` is never used.
+Nothing changes until an admin saves a choice once.
+
+One-time setup: the functions run as `chal-bro@appspot.gserviceaccount.com`; if the admin panel shows "Firebase said no (403)",
+give that account the role **Firebase Authentication Admin** (Google Cloud Console > IAM). The first deploy of `captchaGuard`
+also enables Cloud Scheduler.
+
 ## Tests
 
 ```
-cd functions && npm test      # unit tests: money maths, RazorpayX client, error logging
+cd functions && npm test      # unit tests: money maths, RazorpayX client, error logging, captcha switch
+
 
 # from the project folder (chalbroo): the real functions against the Firestore emulator
 firebase emulators:exec --only firestore --project demo-chalbro "node functions/test/payments.e2e.js"
 firebase emulators:exec --only firestore --project demo-chalbro "node functions/test/cash_payout.e2e.js"
+firebase emulators:exec --only firestore --project demo-chalbro "node functions/test/captcha.e2e.js"   # captcha switch (Firebase's setting replaced by a stand-in)
 ```
 
 The end-to-end tests replace Razorpay and RazorpayX with stand-ins and refuse to run unless `FIRESTORE_EMULATOR_HOST` is set, so they can never touch the live project.

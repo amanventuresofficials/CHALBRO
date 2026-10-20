@@ -13,6 +13,7 @@ const {
 } = require("./payments");
 const { buildErrorDoc, makeLimiter } = require("./errorlog");
 const payouts = require("./payouts");
+const captcha = require("./captcha");
 admin.initializeApp();
 
 // The modular import: `admin.firestore.FieldValue` is missing under the Functions
@@ -736,6 +737,59 @@ exports.razorpayXWebhook = functions.runWith({ secrets: WEBHOOK_SECRETS }).https
     await logServerError("razorpayXWebhook", err, null, null);
     res.status(500).send("error"); // Razorpay retries
   }
+});
+
+// ─── Phone sign-in captcha switch (admin panel: App Settings) ─────────────────────────────────────────
+// See captcha.js. The admin panel writes metadata/captchaConfig; these functions apply it to Firebase's
+// reCAPTCHA setting for phone sign-in and, in "auto" mode, turn it on while the app keeps reporting
+// "too many requests".
+let captchaServiceInstance = null;
+function captchaService() {
+  if (!captchaServiceInstance) {
+    const { Timestamp } = require("firebase-admin/firestore");
+    const projectId = process.env.GCLOUD_PROJECT || (process.env.FIREBASE_CONFIG && JSON.parse(process.env.FIREBASE_CONFIG).projectId);
+    captchaServiceInstance = captcha.createCaptchaService({
+      db: admin.firestore(),
+      FieldValue,
+      Timestamp,
+      identity: captcha.makeIdentityClient({
+        projectId,
+        getToken: async () => (await admin.credential.applicationDefault().getAccessToken()).access_token,
+      }),
+    });
+  }
+  return captchaServiceInstance;
+}
+
+// Called by the login screens (signed out) when Firebase refuses a phone sign-in. Only adds to a counter.
+exports.reportPhoneAuthIssue = functions.https.onCall(async (data) => {
+  const code = data && typeof data.code === "string" ? data.code.slice(0, 60) : "";
+  const result = await captchaService().reportIssue(code);
+  return { counted: !!result.counted };
+});
+
+// An admin saved a new choice: apply it straight away.
+exports.captchaOnConfigWrite = functions.firestore.document("metadata/captchaConfig").onWrite(async () => {
+  try {
+    await captchaService().reconcile("config saved");
+  } catch (err) {
+    console.error("captchaOnConfigWrite failed:", err);
+    await logServerError("captchaOnConfigWrite", err, null, null, "app");
+  }
+  return null;
+});
+
+// Every 2 minutes: turn "auto" on/off as the counters change, and refresh what the admin panel shows.
+exports.captchaGuard = functions.pubsub.schedule("every 2 minutes").onRun(async () => {
+  try {
+    const service = captchaService();
+    await service.reconcile("scheduled");
+    await service.cleanup();
+  } catch (err) {
+    console.error("captchaGuard failed:", err);
+    await logServerError("captchaGuard", err, null, null, "app");
+  }
+  return null;
 });
 
 exports.sendPushNotification = functions.firestore
