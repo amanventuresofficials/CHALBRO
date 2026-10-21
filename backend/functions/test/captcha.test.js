@@ -144,3 +144,23 @@ test("makeIdentityClient turns a refusal into a readable error with the status",
     (e) => e.status === 403 && /Firebase said no \(403\).*permission/.test(e.message),
   );
 });
+
+test("makeIdentityClient reads whether the Phone provider is on (Firebase leaves the field out when it is off)", async () => {
+  const on = fakeFetch(() => ({ status: 200, json: { signIn: { phoneNumber: { enabled: true, testPhoneNumbers: { "+911111111111": "123456" } } } } }));
+  assert.equal(await makeIdentityClient({ projectId: "p", getToken: async () => "t", fetchFn: on.fn }).getPhoneProviderEnabled(), true);
+  const off = fakeFetch(() => ({ status: 200, json: { signIn: { phoneNumber: {} } } }));
+  assert.equal(await makeIdentityClient({ projectId: "p", getToken: async () => "t", fetchFn: off.fn }).getPhoneProviderEnabled(), false);
+  const none = fakeFetch(() => ({ status: 200, json: {} }));
+  assert.equal(await makeIdentityClient({ projectId: "p", getToken: async () => "t", fetchFn: none.fn }).getPhoneProviderEnabled(), false);
+});
+
+test("makeIdentityClient switches the Phone provider with a mask that leaves the test numbers alone", async () => {
+  const f = fakeFetch(() => ({ status: 200, json: {} }));
+  const c = makeIdentityClient({ projectId: "chal-bro", getToken: async () => "t", fetchFn: f.fn });
+  await c.setPhoneProviderEnabled(false);
+  await c.setPhoneProviderEnabled(true);
+  assert.equal(f.calls[0].url, "https://identitytoolkit.googleapis.com/v2/projects/chal-bro/config?updateMask=signIn.phoneNumber.enabled");
+  assert.equal(f.calls[0].init.method, "PATCH");
+  assert.deepEqual(JSON.parse(f.calls[0].init.body), { signIn: { phoneNumber: { enabled: false } } });
+  assert.deepEqual(JSON.parse(f.calls[1].init.body), { signIn: { phoneNumber: { enabled: true } } });
+});

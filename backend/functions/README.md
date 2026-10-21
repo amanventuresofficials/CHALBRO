@@ -50,6 +50,14 @@ One-time setup: the functions run as `chal-bro@appspot.gserviceaccount.com`; if 
 give that account the role **Firebase Authentication Admin** (Google Cloud Console > IAM). The first deploy of `captchaGuard`
 also enables Cloud Scheduler.
 
+## Phone login switch (admin panel > App Settings > Phone login)
+
+`phone_login.js`: `metadata/appConfig.phoneLoginEnabled` (missing = on). The signed-out login screen cannot read Firestore, so it asks
+the PUBLIC callable `getLoginOptions`, which returns only `{phoneLoginEnabled}` (any error = on, so a problem can never take a sign-in
+option away). When an admin CHANGES the switch, `phoneLoginOnConfigWrite` also sets Firebase's own Phone provider
+(`signIn.phoneNumber.enabled`, update mask limited to that field, so the test numbers survive) and writes `metadata/phoneLoginStatus`;
+a failed change is retried by `captchaGuard`. Same IAM role as the captcha switch (Firebase Authentication Admin).
+
 ## Tests
 
 ```
@@ -59,7 +67,8 @@ cd functions && npm test      # unit tests: money maths, RazorpayX client, error
 # from the project folder (chalbroo): the real functions against the Firestore emulator
 firebase emulators:exec --only firestore --project demo-chalbro "node functions/test/payments.e2e.js"
 firebase emulators:exec --only firestore --project demo-chalbro "node functions/test/cash_payout.e2e.js"
-firebase emulators:exec --only firestore --project demo-chalbro "node functions/test/captcha.e2e.js"   # captcha switch (Firebase's setting replaced by a stand-in)
+firebase emulators:exec --only firestore --project demo-chalbro "node functions/test/captcha.e2e.js"
+firebase emulators:exec --only firestore --project demo-chalbro "node functions/test/phone_login.e2e.js"   # captcha switch (Firebase's setting replaced by a stand-in)
 ```
 
 The end-to-end tests replace Razorpay and RazorpayX with stand-ins and refuse to run unless `FIRESTORE_EMULATOR_HOST` is set, so they can never touch the live project.

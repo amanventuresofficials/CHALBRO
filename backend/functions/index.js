@@ -14,6 +14,7 @@ const {
 const { buildErrorDoc, makeLimiter } = require("./errorlog");
 const payouts = require("./payouts");
 const captcha = require("./captcha");
+const phoneLogin = require("./phone_login");
 admin.initializeApp();
 
 // The modular import: `admin.firestore.FieldValue` is missing under the Functions
@@ -743,23 +744,58 @@ exports.razorpayXWebhook = functions.runWith({ secrets: WEBHOOK_SECRETS }).https
 // See captcha.js. The admin panel writes metadata/captchaConfig; these functions apply it to Firebase's
 // reCAPTCHA setting for phone sign-in and, in "auto" mode, turn it on while the app keeps reporting
 // "too many requests".
+let identityClientInstance = null;
+function identityClient() {
+  if (!identityClientInstance) {
+    const projectId = process.env.GCLOUD_PROJECT || (process.env.FIREBASE_CONFIG && JSON.parse(process.env.FIREBASE_CONFIG).projectId);
+    identityClientInstance = captcha.makeIdentityClient({
+      projectId,
+      getToken: async () => (await admin.credential.applicationDefault().getAccessToken()).access_token,
+    });
+  }
+  return identityClientInstance;
+}
+
 let captchaServiceInstance = null;
 function captchaService() {
   if (!captchaServiceInstance) {
     const { Timestamp } = require("firebase-admin/firestore");
-    const projectId = process.env.GCLOUD_PROJECT || (process.env.FIREBASE_CONFIG && JSON.parse(process.env.FIREBASE_CONFIG).projectId);
-    captchaServiceInstance = captcha.createCaptchaService({
-      db: admin.firestore(),
-      FieldValue,
-      Timestamp,
-      identity: captcha.makeIdentityClient({
-        projectId,
-        getToken: async () => (await admin.credential.applicationDefault().getAccessToken()).access_token,
-      }),
-    });
+    captchaServiceInstance = captcha.createCaptchaService({ db: admin.firestore(), FieldValue, Timestamp, identity: identityClient() });
   }
   return captchaServiceInstance;
 }
+
+// The "Phone login" switch (admin panel > App Settings): see phone_login.js.
+let phoneLoginServiceInstance = null;
+function phoneLoginService() {
+  if (!phoneLoginServiceInstance) {
+    const { Timestamp } = require("firebase-admin/firestore");
+    phoneLoginServiceInstance = phoneLogin.createPhoneLoginService({ db: admin.firestore(), Timestamp, identity: identityClient() });
+  }
+  return phoneLoginServiceInstance;
+}
+
+// The login screen (nobody signed in yet, so it cannot read Firestore) asks this: only a yes/no comes back.
+// If anything goes wrong the answer is "on", so a problem here can never lock people out of signing in.
+exports.getLoginOptions = functions.https.onCall(async () => {
+  try {
+    return await phoneLoginService().getOptions();
+  } catch (err) {
+    console.error("getLoginOptions failed:", err);
+    return { phoneLoginEnabled: true };
+  }
+});
+
+// An admin changed the Phone login switch: make Firebase's Phone provider match.
+exports.phoneLoginOnConfigWrite = functions.firestore.document("metadata/appConfig").onWrite(async (change) => {
+  try {
+    await phoneLoginService().onConfigWrite(change.before.exists ? change.before.data() : null, change.after.exists ? change.after.data() : null);
+  } catch (err) {
+    console.error("phoneLoginOnConfigWrite failed:", err);
+    await logServerError("phoneLoginOnConfigWrite", err, null, null, "app");
+  }
+  return null;
+});
 
 // Called by the login screens (signed out) when Firebase refuses a phone sign-in. Only adds to a counter.
 exports.reportPhoneAuthIssue = functions.https.onCall(async (data) => {
@@ -783,8 +819,11 @@ exports.captchaOnConfigWrite = functions.firestore.document("metadata/captchaCon
 exports.captchaGuard = functions.pubsub.schedule("every 2 minutes").onRun(async () => {
   try {
     const service = captchaService();
-    await service.reconcile("scheduled");
+    const result = await service.reconcile("scheduled");
+    // Shown in `firebase functions:log`, so a missing permission is easy to spot (the admin panel shows it too).
+    if (!result.ok) console.warn("captchaGuard: could not read or change Firebase's captcha setting:", result.error);
     await service.cleanup();
+    await phoneLoginService().retryPending();
   } catch (err) {
     console.error("captchaGuard failed:", err);
     await logServerError("captchaGuard", err, null, null, "app");

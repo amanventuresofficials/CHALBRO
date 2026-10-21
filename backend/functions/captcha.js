@@ -107,7 +107,7 @@ const API_HOST = "https://identitytoolkit.googleapis.com";
 
 /**
  * getToken(): Promise<string>  an access token of this project's own service account.
- * Only the one field recaptchaConfig.phoneEnforcementState is ever read or written, so the other
+ * Only recaptchaConfig.phoneEnforcementState and signIn.phoneNumber.enabled are ever written, so the other
  * settings (SMS fraud protection, site keys) are left exactly as they are.
  */
 function makeIdentityClient({ projectId, getToken, fetchFn = (...a) => fetch(...a) }) {
@@ -143,6 +143,17 @@ function makeIdentityClient({ projectId, getToken, fetchFn = (...a) => fetch(...
       if (state !== AUDIT && state !== ENFORCE) throw new Error(`Refusing to set the phone check to "${state}"`);
       await call("PATCH", `${url}?updateMask=recaptchaConfig.phoneEnforcementState`, {
         recaptchaConfig: { phoneEnforcementState: state },
+      });
+    },
+    /** Is the Phone sign-in provider switched on in Firebase? (Firebase leaves the field out when it is off.) */
+    async getPhoneProviderEnabled() {
+      const json = await call("GET", url);
+      return !!(json && json.signIn && json.signIn.phoneNumber && json.signIn.phoneNumber.enabled === true);
+    },
+    /** Switches the Phone provider on or off. The mask keeps the test phone numbers and everything else untouched. */
+    async setPhoneProviderEnabled(enabled) {
+      await call("PATCH", `${url}?updateMask=signIn.phoneNumber.enabled`, {
+        signIn: { phoneNumber: { enabled: !!enabled } },
       });
     },
   };
