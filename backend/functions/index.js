@@ -15,6 +15,7 @@ const { buildErrorDoc, makeLimiter } = require("./errorlog");
 const payouts = require("./payouts");
 const captcha = require("./captcha");
 const phoneLogin = require("./phone_login");
+const adminTeam = require("./admin_team");
 admin.initializeApp();
 
 // The modular import: `admin.firestore.FieldValue` is missing under the Functions
@@ -830,6 +831,38 @@ exports.captchaGuard = functions.pubsub.schedule("every 2 minutes").onRun(async 
   }
   return null;
 });
+
+// ─── Admin Team (admin panel > Admin Team): see admin_team.js ──────────────────────────────────────────
+// Every call checks on the server that the CALLER is an admin, so these work whatever state the security rules are in.
+let adminTeamServiceInstance = null;
+function adminTeamService() {
+  if (!adminTeamServiceInstance) {
+    const { Timestamp } = require("firebase-admin/firestore");
+    adminTeamServiceInstance = adminTeam.createAdminTeamService({ db: admin.firestore(), auth: admin.auth(), FieldValue, Timestamp });
+  }
+  return adminTeamServiceInstance;
+}
+
+// Turns a deliberate refusal into the answer the admin panel shows; anything unexpected is logged as an error.
+async function teamCall(name, context, fn) {
+  try {
+    return await fn(context.auth ? context.auth.uid : null, (context.auth && context.auth.token && context.auth.token.email) || "");
+  } catch (err) {
+    if (err instanceof adminTeam.TeamError) throw new functions.https.HttpsError(err.code, err.message);
+    await logServerError(name, err, null, context);
+    throw new functions.https.HttpsError("internal", "Something went wrong. Please try again.");
+  }
+}
+
+exports.addAdminUser = functions.https.onCall((data, context) =>
+  teamCall("addAdminUser", context, (uid, email) => adminTeamService().addAdmin(uid, email, data && data.input)),
+);
+exports.listAdminUsers = functions.https.onCall((data, context) =>
+  teamCall("listAdminUsers", context, (uid) => adminTeamService().listAdmins(uid)),
+);
+exports.removeAdminUser = functions.https.onCall((data, context) =>
+  teamCall("removeAdminUser", context, (uid) => adminTeamService().removeAdmin(uid, data && data.uid, data && data.label)),
+);
 
 exports.sendPushNotification = functions.firestore
   .document("users/{userId}/notifications/{notificationId}")

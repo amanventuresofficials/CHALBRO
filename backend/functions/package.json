@@ -10,6 +10,7 @@
     "test": "node --test test/errorlog.test.js test/payments.test.js test/payouts.test.js test/captcha.test.js",
     "add-admin": "node scripts/add_admin.js",
     "test:add-admin": "firebase emulators:exec --only auth,firestore --config ../firebase.emulators.json --project demo-chalbro \"node functions/test/add_admin.e2e.js\"",
+    "test:adminteam": "firebase emulators:exec --only firestore --project demo-chalbro \"node functions/test/admin_team.e2e.js\"",
     "test:phonelogin": "firebase emulators:exec --only firestore --project demo-chalbro \"node functions/test/phone_login.e2e.js\"",
     "test:captcha": "firebase emulators:exec --only firestore --project demo-chalbro \"node functions/test/captcha.e2e.js\"",
     "test:e2e": "firebase emulators:exec --only firestore --project demo-chalbro \"node functions/test/payments.e2e.js && node functions/test/cash_payout.e2e.js && node functions/test/migrate_id_proofs.e2e.js\""
