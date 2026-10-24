@@ -9,6 +9,7 @@ const {
   cashFeeFor,
   splitRecovery,
   autoPayoutAmount,
+  resolveMinWithdrawal,
   UPI_PATTERN,
 } = require("./payments");
 const { buildErrorDoc, makeLimiter } = require("./errorlog");
@@ -283,7 +284,7 @@ exports.verifyRazorpayPayment = functions.runWith({ secrets: PAYMENT_SECRETS }).
     const { recovered, credit } = splitRecovery(helperEarnings, w.feeDue);
     const before = Number(w.earnings) > 0 ? Number(w.earnings) : 0;
     const upi = typeof w.upiId === "string" && UPI_PATTERN.test(w.upiId) ? w.upiId : "";
-    const payout = directPayouts && upi ? autoPayoutAmount(before + credit) : 0;
+    const payout = directPayouts && upi ? autoPayoutAmount(before + credit, resolveMinWithdrawal(cfg)) : 0;
 
     tx.set(taskRef, {
       status: "completed",

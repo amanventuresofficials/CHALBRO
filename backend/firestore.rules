@@ -105,6 +105,17 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/metadata/paymentConfig).data.get('useRazorpay', false) == true;
     }
 
+    // The smallest withdrawal the owner allows (admin panel > Payments & Discount): a whole number of
+    // rupees from 1 to 100000 saved in metadata/paymentConfig.minWithdrawal. Missing, or anything else,
+    // means the default of 100, so a wrong value can never lower the bar by accident.
+    // Read the same way by the app (lib/utils/withdrawal.dart) and the payout function (payments.js).
+    function minWithdrawal() {
+      let saved = exists(/databases/$(database)/documents/metadata/paymentConfig)
+        ? get(/databases/$(database)/documents/metadata/paymentConfig).data.get('minWithdrawal', 100)
+        : 100;
+      return (saved is int && saved >= 1 && saved <= 100000) ? saved : 100;
+    }
+
     // `earnings` is what ChalBro owes a helper for tasks paid through Razorpay. Only the
     // payment Cloud Function (Admin SDK) and admins can ever raise it; the owner can only
     // lower it, by withdrawing (see /withdrawals). `feeDue` is the platform fee a helper
@@ -553,12 +564,13 @@ service cloud.firestore {
       // A withdrawal request holds the money: in the SAME batch the requester's earnings must
       // go down by exactly the amount (checked with getAfter), so the same rupees can never
       // be asked for twice. Rejecting refunds it (admin). Earnings only come from confirmed
-      // Razorpay payments, so there is nothing else to check. Amount: whole rupees, 100 to 100000.
+      // Razorpay payments, so there is nothing else to check. Amount: whole rupees, from the owner's
+      // smallest withdrawal (default 100, see minWithdrawal()) up to 100000.
       allow create: if isActiveUser() && request.auth.uid == request.resource.data.uid
         && request.resource.data.keys().hasOnly(['uid', 'amount', 'paymentDetails', 'userName', 'status', 'timestamp'])
         && request.resource.data.keys().hasAll(['uid', 'amount', 'paymentDetails', 'status', 'timestamp'])
         && request.resource.data.amount is int
-        && request.resource.data.amount >= 100
+        && request.resource.data.amount >= minWithdrawal()
         && request.resource.data.amount <= 100000
         && request.resource.data.paymentDetails is string
         && request.resource.data.paymentDetails.matches('^[A-Za-z0-9._-]{2,64}@[A-Za-z0-9]{2,32}$')

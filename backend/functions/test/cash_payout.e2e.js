@@ -375,6 +375,32 @@ async function main() {
     assert.equal((await col("withdrawals")).filter((x) => x.taskId === "p4").length, 0);
   });
 
+  await check("the owner's own smallest withdrawal decides what is sent straight away", async () => {
+    // 270 is waiting but the bar is 300: nothing is sent
+    await resetWorker({ upiId: "meera@okhdfc" });
+    await setConfig({ useRazorpay: true, autoPayout: true, minWithdrawal: 300 });
+    await seedTask("p5");
+    await payOnline("p5", "pay_CP_p5");
+    assert.equal((await user()).earnings, 270);
+    assert.equal((await col("withdrawals")).filter((x) => x.taskId === "p5").length, 0);
+    // a lower bar than the default: 70 (after a 200 fee) is at least 50, so it is sent
+    await resetWorker({ upiId: "meera@okhdfc", feeDue: 200 });
+    await setConfig({ useRazorpay: true, autoPayout: true, minWithdrawal: 50 });
+    await seedTask("p6");
+    await payOnline("p6", "pay_CP_p6");
+    const w = (await col("withdrawals")).filter((x) => x.taskId === "p6");
+    assert.equal(w.length, 1);
+    assert.equal(w[0].amount, 70);
+    assert.equal((await user()).earnings, 0);
+    // an unusable number never lowers the bar: back to 100, so 70 waits
+    await resetWorker({ upiId: "meera@okhdfc", feeDue: 200 });
+    await setConfig({ useRazorpay: true, autoPayout: true, minWithdrawal: 0 });
+    await seedTask("p7");
+    await payOnline("p7", "pay_CP_p7");
+    assert.equal((await user()).earnings, 70);
+    assert.equal((await col("withdrawals")).filter((x) => x.taskId === "p7").length, 0);
+  });
+
   console.log("The payout trigger and the webhook");
   const makeWithdrawal = async (id, extra = {}) => {
     await resetWorker({ earnings: 0 });

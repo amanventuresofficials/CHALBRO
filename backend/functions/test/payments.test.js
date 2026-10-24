@@ -6,6 +6,7 @@ const {
   cashFeeFor,
   splitRecovery,
   autoPayoutAmount,
+  resolveMinWithdrawal,
   UPI_PATTERN,
   MIN_PAYOUT,
   MAX_PAYOUT,
@@ -55,6 +56,26 @@ test("direct payouts wait until there is at least the minimum, and are capped", 
   assert.equal(autoPayoutAmount(500000), MAX_PAYOUT);
   assert.equal(autoPayoutAmount(NaN), 0);
   assert.equal(autoPayoutAmount(-5), 0);
+});
+
+test("the smallest withdrawal is the owner's number, 100 when nothing usable is saved", () => {
+  assert.equal(resolveMinWithdrawal(undefined), 100);
+  assert.equal(resolveMinWithdrawal({}), 100);
+  assert.equal(resolveMinWithdrawal({ minWithdrawal: 10 }), 10);
+  assert.equal(resolveMinWithdrawal({ minWithdrawal: 1 }), 1);
+  assert.equal(resolveMinWithdrawal({ minWithdrawal: MAX_PAYOUT }), MAX_PAYOUT);
+  // unusable values never lower the bar by accident
+  for (const bad of [0, -5, 1.5, "10", null, NaN, MAX_PAYOUT + 1, true, [], {}]) {
+    assert.equal(resolveMinWithdrawal({ minWithdrawal: bad }), 100, `value ${JSON.stringify(bad)}`);
+  }
+});
+
+test("direct payouts follow the owner's smallest withdrawal", () => {
+  assert.equal(autoPayoutAmount(9.9, 10), 0);
+  assert.equal(autoPayoutAmount(10, 10), 10);
+  assert.equal(autoPayoutAmount(9, 5), 9);
+  assert.equal(autoPayoutAmount(240.7, 250), 0);
+  assert.equal(autoPayoutAmount(500000, 10), MAX_PAYOUT);
 });
 
 test("UPI id pattern matches the app and the rules", () => {

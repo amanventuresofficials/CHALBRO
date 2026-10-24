@@ -52,14 +52,28 @@ function splitRecovery(helperEarnings, feeDue) {
 }
 
 // Same limits as the app's withdrawal rules (lib/utils/withdrawal.dart, firestore.rules).
+// MIN_PAYOUT is the DEFAULT smallest withdrawal; the owner can change it in the admin panel
+// (metadata/paymentConfig.minWithdrawal), see resolveMinWithdrawal. The largest stays fixed.
 const MIN_PAYOUT = 100;
 const MAX_PAYOUT = 100000;
+const LOWEST_MIN_WITHDRAWAL = 1;
 const UPI_PATTERN = /^[A-Za-z0-9._-]{2,64}@[A-Za-z0-9]{2,32}$/;
 
+/**
+ * The smallest withdrawal the owner allows, from metadata/paymentConfig.minWithdrawal: a whole number of
+ * rupees from 1 to the largest withdrawal. Anything missing or unusable means the default (100), the same
+ * way the security rules and the app read it.
+ */
+function resolveMinWithdrawal(config) {
+  const v = config ? config.minWithdrawal : undefined;
+  if (typeof v !== "number" || !Number.isInteger(v) || v < LOWEST_MIN_WITHDRAWAL || v > MAX_PAYOUT) return MIN_PAYOUT;
+  return v;
+}
+
 /** Whole rupees to send straight to a helper's UPI id from [balance], or 0 to keep waiting. */
-function autoPayoutAmount(balance) {
+function autoPayoutAmount(balance, min = MIN_PAYOUT) {
   const whole = Math.floor(Number(balance));
-  if (!Number.isFinite(whole) || whole < MIN_PAYOUT) return 0;
+  if (!Number.isFinite(whole) || whole < min) return 0;
   return Math.min(whole, MAX_PAYOUT);
 }
 
@@ -81,6 +95,8 @@ module.exports = {
   splitRecovery,
   MIN_PAYOUT,
   MAX_PAYOUT,
+  LOWEST_MIN_WITHDRAWAL,
   UPI_PATTERN,
+  resolveMinWithdrawal,
   autoPayoutAmount,
 };
